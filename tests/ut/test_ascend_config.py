@@ -1458,6 +1458,93 @@ class TestUpstreamConfigCompatibility(TestBase):
         self.assertTrue(AscendConfig._is_megamoe_supported_by_config(minimax_m3))
 
     @patch(
+        "vllm_ascend.ascend_config.get_current_hardware_profile",
+        return_value=get_hardware_profile(AscendDeviceType.A3),
+    )
+    @patch("torch.version.cann", "9.2.0", create=True)
+    def test_a3_megamoe_w8a8_intermediate_tail(self, _mock_profile):
+        text_config = SimpleNamespace(hidden_size=5120, moe_intermediate_size=2304)
+        model_config = SimpleNamespace(
+            architectures=["DeepseekV41ForCausalLM"],
+            hf_text_config=text_config,
+            hf_config=SimpleNamespace(
+                quantization_config={"quant_method": "ascend", "model_quant_type": "W8A8_DYNAMIC"}
+            ),
+        )
+        vc = SimpleNamespace(model_config=model_config)
+        self.assertTrue(AscendConfig._is_megamoe_supported_by_config(vc))
+        self.assertEqual(text_config.moe_intermediate_size, 2304)
+        for intermediate in (1024, 1280, 1536, 1792, 2048, 2304, 2560, 2816, 3072):
+            with self.subTest(intermediate=intermediate):
+                text_config.moe_intermediate_size = intermediate
+                self.assertTrue(AscendConfig._is_megamoe_supported_by_config(vc))
+        for intermediate in (1023, 1279, 2303, 2305, 3073):
+            with self.subTest(intermediate=intermediate):
+                text_config.moe_intermediate_size = intermediate
+                self.assertFalse(AscendConfig._is_megamoe_supported_by_config(vc))
+        text_config.moe_intermediate_size = 2304
+        for hidden in (1023, 5121, 8193):
+            with self.subTest(hidden=hidden), patch.object(text_config, "hidden_size", hidden):
+                self.assertFalse(AscendConfig._is_megamoe_supported_by_config(vc))
+
+    @patch(
+        "vllm_ascend.ascend_config.get_current_hardware_profile",
+        return_value=get_hardware_profile(AscendDeviceType.A3),
+    )
+    @patch("torch.version.cann", "9.2.0", create=True)
+    def test_a3_megamoe_intermediate_tail_requires_explicit_w8a8(self, _mock_profile):
+        text_config = SimpleNamespace(hidden_size=5120, moe_intermediate_size=2304)
+        model_config = SimpleNamespace(
+            architectures=["DeepseekV41ForCausalLM"],
+            hf_text_config=text_config,
+        )
+        vc = SimpleNamespace(model_config=model_config)
+        self.assertFalse(AscendConfig._is_megamoe_supported_by_config(vc))
+        for quant_type in ("w8a8", "W8A8_DYNAMIC", SimpleNamespace(name="W8A8")):
+            with (
+                self.subTest(quant_type=quant_type),
+                patch.object(text_config, "moe_quantize", quant_type, create=True),
+            ):
+                self.assertTrue(AscendConfig._is_megamoe_supported_by_config(vc))
+        vc.model_config.hf_config = SimpleNamespace(
+            quantization_config={"quant_method": "ascend", "model_quant_type": "W8A8_DYNAMIC"}
+        )
+        with patch.object(model_config, "architectures", ["Qwen3MoeForCausalLM"]):
+            self.assertFalse(AscendConfig._is_megamoe_supported_by_config(vc))
+        for quant_type in ("W4A8", "W4A8_DYNAMIC", "W8A8MXFP", "FP8", "NONE"):
+            with (
+                self.subTest(quant_type=quant_type),
+                patch.object(text_config, "moe_quantize", quant_type, create=True),
+            ):
+                self.assertFalse(AscendConfig._is_megamoe_supported_by_config(vc))
+
+    @patch(
+        "vllm_ascend.ascend_config.get_current_hardware_profile",
+        return_value=get_hardware_profile(AscendDeviceType.A3),
+    )
+    def test_a3_megamoe_intermediate_tail_keeps_older_cann_gate(self, _mock_profile):
+        text_config = SimpleNamespace(hidden_size=5120, moe_intermediate_size=2304, moe_quantize="W8A8_DYNAMIC")
+        vc = SimpleNamespace(
+            model_config=SimpleNamespace(
+                architectures=["DeepseekV41ForCausalLM"],
+                hf_text_config=text_config,
+            )
+        )
+        for version in (None, "9.1.0", "unknown"):
+            with self.subTest(version=version), patch("torch.version.cann", version, create=True):
+                self.assertFalse(AscendConfig._is_megamoe_supported_by_config(vc))
+                with patch.object(text_config, "moe_intermediate_size", 2048):
+                    self.assertTrue(AscendConfig._is_megamoe_supported_by_config(vc))
+        with (
+            patch("torch.version.cann", "9.2.0", create=True),
+            patch(
+                "vllm_ascend.ascend_config.get_current_hardware_profile",
+                return_value=get_hardware_profile(AscendDeviceType.A2),
+            ),
+        ):
+            self.assertFalse(AscendConfig._is_megamoe_supported_by_config(vc))
+
+    @patch(
         "vllm_ascend.device.hardware_profile.get_current_hardware_profile",
         return_value=get_hardware_profile(AscendDeviceType.A2),
     )

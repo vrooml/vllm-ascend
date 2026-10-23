@@ -721,6 +721,20 @@ class AscendSharedExperts:
             return SharedExpertMLPPath.W8A8_MXFP_LINEAR
         return SharedExpertMLPPath.LINEAR_WRAPPER
 
+    def enqueue_mlp_for_fused_routed(self, submitted_gate_up: SubmittedSharedExpertGateUp) -> torch.Tensor:
+        """Queue the remaining shared MLP before a monolithic routed op.
+
+        Gate-Up already waits for the router on this auxiliary stream. The
+        activation and Down projection need no routed intermediate events.
+        Do not submit output collectives or join streams here: SP-only must
+        order its ReduceScatter after routed finalize, and the main stream
+        must remain free to launch MegaMoE.
+        """
+        if not self.multistream_overlap:
+            raise RuntimeError("Early shared MLP submission requires multistream overlap.")
+        with npu_stream_switch(shared_experts_calculation_stream(), enabled=True):
+            return self._finish_shared_mlp(submitted_gate_up, RoutedMoEMilestones())
+
     def wait_for_output(self) -> None:
         """Join a deferred SP shared-output collective on the current stream."""
         # This join is intentionally stream-based. The shared forward executes
@@ -734,7 +748,10 @@ class AscendSharedExperts:
         milestones: RoutedMoEMilestones,
         defer_output_wait: bool = False,
         submitted_gate_up: SubmittedSharedExpertGateUp | None = None,
+        submitted_mlp_output: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if submitted_mlp_output is not None and (submitted_gate_up is None or not self.multistream_overlap):
+            raise RuntimeError("An early shared MLP output requires its Gate-Up submission and multistream overlap.")
         mode = self.parallel_mode()
         if submitted_gate_up is None:
             with npu_stream_switch(shared_experts_calculation_stream(), enabled=self.multistream_overlap):
@@ -756,7 +773,11 @@ class AscendSharedExperts:
 
         local_dp_metadata = submitted_gate_up.local_dp_metadata
         with npu_stream_switch(shared_experts_calculation_stream(), enabled=self.multistream_overlap):
-            shared_out = self._finish_shared_mlp(submitted_gate_up, milestones)
+            shared_out = (
+                self._finish_shared_mlp(submitted_gate_up, milestones)
+                if submitted_mlp_output is None
+                else submitted_mlp_output
+            )
             if self.multistream_overlap and mode is SharedExpertParallelMode.SEQUENCE_PARALLEL_ONLY:
                 self._wait_for_milestone(
                     milestones.routed_finalize_done,

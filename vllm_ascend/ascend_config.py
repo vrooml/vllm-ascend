@@ -23,6 +23,7 @@ import os
 from statistics import NormalDist
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
+from packaging.version import InvalidVersion, Version
 from pydantic import ConfigDict, TypeAdapter, field_validator, model_validator
 from pydantic_core import ArgsKwargs
 from vllm.logger import logger
@@ -36,6 +37,23 @@ if TYPE_CHECKING:
 
 _KVPP_SUPPORTED_CONNECTORS = ("MooncakeConnectorV2", "AscendStoreConnector")
 _MEGA_MOE_SUPPORTED = None
+_MEGAMOE_LEGACY_INTERMEDIATE_ALIGNMENT = 512
+_MEGAMOE_W8A8_INTERMEDIATE_ALIGNMENT = 256
+_MEGAMOE_W8A8_TAIL_MIN_CANN_VERSION = Version("9.2.0")
+_DEEPSEEK_V4_MEGAMOE_ARCHITECTURES = frozenset(
+    {
+        "DeepseekV4ForCausalLM",
+        "DeepseekV4ForConditionalGeneration",
+        "DeepseekV41ForCausalLM",
+    }
+)
+_DEEPSEEK_V41_MEGAMOE_ARCHITECTURES = frozenset({"DeepseekV41ForCausalLM"})
+
+
+def _has_model_architecture(vllm_config: VllmConfig, supported_architectures: frozenset[str]) -> bool:
+    model_config = getattr(vllm_config, "model_config", None)
+    architectures = getattr(model_config, "architectures", None) or ()
+    return any(architecture in supported_architectures for architecture in architectures)
 
 
 def is_mega_moe_supported() -> bool:
@@ -836,17 +854,7 @@ class AscendConfig:
             "MiniMax M3 does not support enable_fused_mc2=1 (dispatch_ffn_combine). "
             "Set additional_config.enable_fused_mc2 to 2 to enable MegaMoe, or 0 to disable fused MC2."
         )
-        if self.enable_fused_mc2 == 1 and self.multistream_overlap_shared_expert:
-            self.multistream_overlap_shared_expert = False
-            logger.warning_once(
-                "enable_fused_mc2 and multistream_overlap_shared_expert "
-                "cannot be enabled at the same time. Setting multistream_overlap_shared_expert to False."
-            )
-        if self.enable_fused_mc2 == 1 and is_mega_moe_supported() and not self._is_megamoe_supported_by_config(vc):
-            self.enable_fused_mc2 = 0
-            logger.warning_once(
-                "MegaMoe is not supported for this model config; additional_config.enable_fused_mc2 will be set to 0."
-            )
+        self._validate_fused_mc2_shared_expert_overlap(vc)
 
         # mlapo_keep_prefill_weights preconditions: the prefill weights are only
         # freed by MLAPO in the MLA attention path, so the keep switch is only
@@ -1031,10 +1039,74 @@ class AscendConfig:
             "or use MooncakeLayerwiseConnector, which quantizes KV cache before transfer."
         )
 
+    def _validate_fused_mc2_shared_expert_overlap(self, vc: VllmConfig) -> None:
+        """Resolve the routed backend before applying shared-stream restrictions."""
+        if self.enable_fused_mc2 == 1 and is_mega_moe_supported() and not self._is_megamoe_supported_by_config(vc):
+            self.enable_fused_mc2 = 0
+            logger.warning_once(
+                "MegaMoe is not supported for this model config; additional_config.enable_fused_mc2 will be set to 0."
+            )
+        # CANN MegaMoE can overlap an independent shared MLP as a whole. Keep
+        # the legacy dispatch_ffn_combine restriction, including when the
+        # requested CANN package is missing. Resolve model fallback first so
+        # an unfused backend retains its normal shared-expert overlap policy.
+        is_deepseek_v4 = _has_model_architecture(vc, _DEEPSEEK_V4_MEGAMOE_ARCHITECTURES)
+        if (
+            self.enable_fused_mc2 == 1
+            and self.multistream_overlap_shared_expert
+            and (not is_mega_moe_supported() or not is_deepseek_v4)
+        ):
+            self.multistream_overlap_shared_expert = False
+            logger.warning_once(
+                "Fused MC2 and multistream_overlap_shared_expert are only supported together "
+                "by the DeepSeek V4/V4.1 CANN MegaMoE adapter. "
+                "Setting multistream_overlap_shared_expert to False."
+            )
+
     def _check_mix_placement(self):
         if self.mix_placement:
             if self.enable_shared_expert_dp or self.multistream_overlap_shared_expert:
                 raise ValueError("Mix placement is not supported with shared expert DP or multistream overlap.")
+
+    @staticmethod
+    def _get_megamoe_intermediate_alignment(vllm_config: VllmConfig) -> int:
+        profile = get_current_hardware_profile()
+        # This is the A3 INT8 kernel contract. A2 keeps the legacy alignment;
+        # the MXFP path has its own configuration validation below.
+        if not profile.supports(HardwareCapability.CANN_MEGAMOE) or profile.supports(
+            HardwareCapability.CANN_MEGAMOE_MXFP
+        ):
+            return _MEGAMOE_LEGACY_INTERMEDIATE_ALIGNMENT
+        # Config-module discovery must not initialize torch backends or recurse
+        # through a partially imported vllm.config. This runs after discovery.
+        import torch
+
+        raw_version = getattr(torch.version, "cann", None)
+        if not isinstance(raw_version, str):
+            return _MEGAMOE_LEGACY_INTERMEDIATE_ALIGNMENT
+        try:
+            cann_version = Version(raw_version)
+        except InvalidVersion:
+            return _MEGAMOE_LEGACY_INTERMEDIATE_ALIGNMENT
+        if cann_version < _MEGAMOE_W8A8_TAIL_MIN_CANN_VERSION:
+            return _MEGAMOE_LEGACY_INTERMEDIATE_ALIGNMENT
+        if not _has_model_architecture(vllm_config, _DEEPSEEK_V41_MEGAMOE_ARCHITECTURES):
+            return _MEGAMOE_LEGACY_INTERMEDIATE_ALIGNMENT
+
+        model_config = vllm_config.model_config
+        text_config = model_config.hf_text_config
+        quant_type = getattr(text_config, "moe_quantize", getattr(text_config, "quantize", None))
+        if quant_type is None:
+            # Nested V4.1 checkpoints declare the quantization format on the
+            # outer config, while their routed FFN dimensions live in text_config.
+            hf_config = getattr(model_config, "hf_config", None)
+            quant_config = getattr(hf_config, "quantization_config", None)
+            if isinstance(quant_config, dict) and quant_config.get("quant_method") == "ascend":
+                quant_type = quant_config.get("model_quant_type")
+        quant_name = str(getattr(quant_type, "name", quant_type)).lower()
+        if quant_name in {"w8a8", "w8a8_dynamic", "quanttype.w8a8"}:
+            return _MEGAMOE_W8A8_INTERMEDIATE_ALIGNMENT
+        return _MEGAMOE_LEGACY_INTERMEDIATE_ALIGNMENT
 
     @staticmethod
     def _is_megamoe_supported_by_config(vllm_config: VllmConfig) -> bool:
@@ -1057,7 +1129,12 @@ class AscendConfig:
             moe_intermediate_size = getattr(hf_text_config, "intermediate_size", None)
         if moe_intermediate_size is None:
             return False
-        if moe_intermediate_size < 1024 or moe_intermediate_size > 3072 or moe_intermediate_size % 512 != 0:
+        if moe_intermediate_size < 1024 or moe_intermediate_size > 3072:
+            return False
+        intermediate_alignment = _MEGAMOE_LEGACY_INTERMEDIATE_ALIGNMENT
+        if moe_intermediate_size % intermediate_alignment != 0:
+            intermediate_alignment = AscendConfig._get_megamoe_intermediate_alignment(vllm_config)
+        if moe_intermediate_size % intermediate_alignment != 0:
             return False
 
         quant_type = getattr(hf_text_config, "moe_quantize", getattr(hf_text_config, "quantize", None))

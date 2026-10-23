@@ -1986,6 +1986,8 @@ def test_sp_multistream_custom_op_fake_returns_local_token_shape(hidden_dim_unpa
     assert routed_out.shape == torch.Size([2, expected_routed_width])
 
 
+@pytest.mark.parametrize("enable_deepseek_megamoe_shared_overlap", [False, True])
+@pytest.mark.parametrize("cann_mega_moe", [False, True])
 @pytest.mark.parametrize(
     ("mode", "multistream_overlap", "has_routed_input_transform", "uses_sp_custom_op"),
     [
@@ -2002,6 +2004,8 @@ def test_runner_selects_sp_multistream_custom_op(
     multistream_overlap,
     has_routed_input_transform,
     uses_sp_custom_op,
+    cann_mega_moe,
+    enable_deepseek_megamoe_shared_overlap,
 ):
     upstream_forward_entry = object()
     moe_config = SimpleNamespace(hidden_dim=4, ep_size=1)
@@ -2045,7 +2049,12 @@ def test_runner_selects_sp_multistream_custom_op(
     monkeypatch.setattr(fused_moe_module, "get_tp_group", MagicMock(return_value=object()))
     monkeypatch.setattr(fused_moe_module, "get_dp_group", MagicMock(return_value=object()))
     monkeypatch.setattr(fused_moe_module, "setup_moe_comm_method", MagicMock())
-    monkeypatch.setattr(fused_moe_module, "get_moe_comm_method", MagicMock(return_value=None))
+    fused_comm = SimpleNamespace(mega_moe=object()) if cann_mega_moe else None
+    monkeypatch.setattr(
+        fused_moe_module,
+        "get_moe_comm_method",
+        lambda kind, config: fused_comm if kind is MoECommType.FUSED_MC2 else None,
+    )
 
     runner = AscendMoERunner(
         "model.layers.0.mlp",
@@ -2054,8 +2063,12 @@ def test_runner_selects_sp_multistream_custom_op(
         routed_experts=routed_experts,
         shared_experts=object(),
         routed_input_transform=object() if has_routed_input_transform else None,
+        enable_deepseek_megamoe_shared_overlap=enable_deepseek_megamoe_shared_overlap,
     )
 
+    assert runner._overlap_mega_moe is (
+        enable_deepseek_megamoe_shared_overlap and multistream_overlap and cann_mega_moe
+    )
     if uses_sp_custom_op:
         assert runner._forward_entry is torch.ops.vllm.ascend_moe_forward_shared_sp
     else:

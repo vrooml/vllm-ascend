@@ -378,6 +378,7 @@ class DeepseekV4MoE(nn.Module):
             is_sequence_parallel=self.is_sequence_parallel,
             n_shared_experts=config.n_shared_experts if self.is_fusion_moe_shared_experts_enabled else 0,
             hash_indices_table=self.gate.tid2eid,
+            runner_args={"enable_deepseek_megamoe_shared_overlap": True},
         )
 
     def forward(

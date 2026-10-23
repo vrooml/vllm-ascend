@@ -96,6 +96,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         routed_input_transform=None,
         routed_output_transform=None,
         routed_scaling_factor=1,
+        enable_deepseek_megamoe_shared_overlap=False,
     ):
         super().__init__(
             layer_name,
@@ -137,8 +138,16 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         setup_moe_comm_method(self.moe_config)
         # Communication objects are shared across MoE layers. Keep the bound
         # activation with its owning layer when a later layer replaces them.
-        self.routed_experts.mega_moe_activation_kwargs = getattr(
-            get_moe_comm_method(MoECommType.FUSED_MC2, self.moe_config), "mega_moe_activation_kwargs", None
+        fused_mc2_comm = get_moe_comm_method(MoECommType.FUSED_MC2, self.moe_config)
+        self.routed_experts.mega_moe_activation_kwargs = getattr(fused_mc2_comm, "mega_moe_activation_kwargs", None)
+        # Bind eligibility to the communicator that actually loaded CANN
+        # MegaMoE, rather than rereading the process-global config singleton.
+        # The per-forward backend check still handles AllToAll/LoRA fallback.
+        self._overlap_mega_moe = (
+            enable_deepseek_megamoe_shared_overlap
+            and self.ascend_shared_experts is not None
+            and self.ascend_shared_experts.multistream_overlap
+            and getattr(fused_mc2_comm, "mega_moe", None) is not None
         )
         alltoall_comm = get_moe_comm_method(MoECommType.ALLTOALL, self.moe_config)
         if alltoall_comm is not None:
@@ -521,6 +530,18 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                     router_logits,
                 )
             )
+            submitted_mlp_output = None
+            if (
+                submitted_gate_up is not None
+                and getattr(self, "_overlap_mega_moe", False)
+                and _EXTRA_CTX.moe_comm_type is MoECommType.FUSED_MC2
+                and _EXTRA_CTX.use_mega_moe
+            ):
+                # MegaMoE has no dispatch/GMM/combine events. Queue the whole
+                # independent shared MLP now, before the monolithic routed op.
+                # Output collectives and the stream join remain after routed
+                # finalize, so the two streams cannot wait on each other.
+                submitted_mlp_output = self.ascend_shared_experts.enqueue_mlp_for_fused_routed(submitted_gate_up)
             routed_out, milestones = self.routed_experts.forward_impl(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
@@ -532,7 +553,15 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             if prepared_shared_input.is_gathered:
                 milestones.routed_finalize_done = torch.npu.current_stream().record_event()
 
-            if submitted_gate_up is None:
+            if submitted_mlp_output is not None:
+                shared_out = self.ascend_shared_experts.forward(
+                    prepared_shared_input,
+                    milestones,
+                    defer_output_wait=defer_shared_output_wait,
+                    submitted_gate_up=submitted_gate_up,
+                    submitted_mlp_output=submitted_mlp_output,
+                )
+            elif submitted_gate_up is None:
                 shared_out = self.ascend_shared_experts.forward(
                     prepared_shared_input,
                     milestones,

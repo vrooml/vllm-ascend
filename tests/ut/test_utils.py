@@ -881,6 +881,38 @@ class TestIsRlWeightUpdateEnabled(TestBase):
             self.assertTrue(utils.is_rl_weight_update_enabled(self._vllm_config(SimpleNamespace(backend="npu_ipc"))))
 
 
+class TestRefreshBlockSizeDeepSeekV41(TestBase):
+    def test_explicit_deepseek_blocks_survive_chunked_prefill(self):
+        cases = (
+            ("deepseek_v41", 32, 32),
+            ("deepseek_v41", 64, 64),
+            ("deepseek_v41", 128, 128),
+            ("deepseek_v4", 32, 32),
+            ("other_model", 32, 128),
+            ("other_model", 128, 128),
+        )
+        for model_type, requested, expected in cases:
+            with self.subTest(model_type=model_type, requested=requested):
+                config = SimpleNamespace(
+                    cache_config=SimpleNamespace(
+                        block_size=requested,
+                        enable_prefix_caching=False,
+                    ),
+                    model_config=SimpleNamespace(
+                        hf_config=SimpleNamespace(model_type=model_type),
+                        is_hybrid=False,
+                    ),
+                    scheduler_config=SimpleNamespace(enable_chunked_prefill=True),
+                    speculative_config=None,
+                )
+                with (
+                    mock.patch("vllm_ascend.utils.is_c8_mxfp_kv_quant", return_value=False),
+                    mock.patch("vllm_ascend.utils.get_ascend_config", return_value=None),
+                ):
+                    utils.refresh_block_size(config)
+                self.assertEqual(config.cache_config.block_size, expected)
+
+
 class TestRefreshBlockSizeC8MXFP(TestBase):
     def _config(self, block_size, *, is_hybrid=False, user_specified=False):
         return SimpleNamespace(
