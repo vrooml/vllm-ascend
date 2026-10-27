@@ -653,7 +653,7 @@ class NPUModelRunner(GPUModelRunner):
         )
         profile_kwargs = {"randomize_inputs": randomize_inputs}
         forward_failed = True
-        with dp_coordination_context:
+        with dp_coordination_context, _target_embedding_dummy_collective(self):
             try:
                 output = super().execute_model(
                     scheduler_output,
@@ -1452,3 +1452,40 @@ def graph_manager_wrapper(model_runner):
         yield
     finally:
         vllm_model_runner.ModelCudaGraphManager = original_graph_manager
+
+
+@contextmanager
+def _target_embedding_dummy_collective(runner):
+    """Join target Embed-TP at its normal input-preparation position."""
+    enabled = (
+        runner.ascend_config.finegrained_tp_config.embedding_tensor_parallel_size > 1
+        and runner.uses_inputs_embeds
+        and runner.is_first_pp_rank
+    )
+    if not enabled:
+        yield
+        return
+    state = runner.model_state
+    had_instance_method = "dummy_inputs_embeds" in state.__dict__
+    previous_instance_method = state.__dict__.get("dummy_inputs_embeds")
+    original = state.dummy_inputs_embeds
+
+    def join_target_embedding(num_tokens):
+        # Draft capture/propose uses the baseline disabled fine-grained scope.
+        # ModelState can be shared, so do not join target collectives there.
+        if runner.ascend_config.finegrained_tp_config.embedding_tensor_parallel_size <= 1:
+            return original(num_tokens)
+        # Real peers call target embed_input_ids here; an idle peer must issue
+        # the same collectives before entering the decoder. Its values are unused.
+        runner.model.embed_input_ids(runner.input_buffers.input_ids[:num_tokens])
+        runner._target_embedding_idle_joins = getattr(runner, "_target_embedding_idle_joins", 0) + 1
+        return original(num_tokens)
+
+    state.dummy_inputs_embeds = join_target_embedding
+    try:
+        yield
+    finally:
+        if had_instance_method:
+            state.dummy_inputs_embeds = previous_instance_method
+        else:
+            del state.dummy_inputs_embeds
