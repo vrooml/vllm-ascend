@@ -21,7 +21,8 @@ by the validation launcher before either GLM5Next MTP module is imported.
 `p_prefill_uniform_1031.py` records the additional adapter used by the
 16-die DP16/TP1 prefill experiments. Install it in each worker after the
 normal vLLM 0.31 compatibility dispatch patch and before model execution.
-Use `FG_ROLE=p`, `P_FORCE_FG_ROWS=1`, and `P_ZERO_FG_PADDING=1`.
+Use `FG_ROLE=p`, `P_FORCE_FG_ROWS=1`, `P_ZERO_FG_PADDING=1`, and
+`P_LOCAL_PROJECTION_PADDING=1`.
 The existing target-only MTP scope must also be installed. Diagnostic flags
 `P_FINITE_PROBE`, `P_REFERENCE_PROBE`, and `P_UNIFORM_TARGET` are disabled
 for performance and accuracy measurements.
@@ -38,10 +39,18 @@ The execute guard excludes graph capture and warmup. This prevents a stale
 retains its original fine-grained configuration, so the adapter is inactive
 inside the existing MTP capture/propose calls.
 
+Keep the runner's original eager batch descriptor and per-DP token counts.
+Padding the entire target forward to the busiest DP also pads the unrelated
+MoE layers: the 128K MLP case then requested a 9.94 GiB token-unpermute
+workspace and ran out of memory. Local projection padding leaves attention
+and MoE at their own token counts and trims each projection result before
+the next layer. The agreed projection size is at least the runner's original
+speculative microbatch size so idle dummy ranks can join the same collective.
+
 The adapter uses process-local state: one worker runs one synchronous target
 forward at a time, with draft calls nested inside it. It adds no collective.
 It wraps the inherited dispatch because this version has no hook to replace
-the eager batch descriptor after DP agreement. A permanent implementation
+the projection alignment state after DP agreement. A permanent implementation
 should carry row counts through the runner/forward context and pad inside
 the custom projection operators, replacing this validation adapter.
 

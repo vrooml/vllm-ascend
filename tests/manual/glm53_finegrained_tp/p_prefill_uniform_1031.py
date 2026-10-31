@@ -22,6 +22,7 @@ _last_eager = False
 _step_dummy = False
 _in_execute = False
 _target_config = None
+_minimum_alignment = 1
 _mlp_input_rows = {}
 _events = []
 _finite_events = []
@@ -66,12 +67,19 @@ def install():
             _last_eager = sync is not None and sync.eager
         if enabled() and sync is not None and sync.eager:
             rows = sync.num_tokens_across_dp.tolist()
-            count = max(rows)
-            desc = replace(desc, num_tokens=count, num_reqs=max(desc.num_reqs or 0, 1))
-            sync = replace(sync, num_tokens_across_dp=torch.full_like(sync.num_tokens_across_dp, count))
+            count = max(max(rows), _minimum_alignment)
+            if os.environ.get("P_LOCAL_PROJECTION_PADDING") != "1":
+                desc = replace(desc, num_tokens=count, num_reqs=max(desc.num_reqs or 0, 1))
+                sync = replace(sync, num_tokens_across_dp=torch.full_like(sync.num_tokens_across_dp, count))
             _last_aligned = count
             if len(_events) < 12:
-                event = dict(rows=rows, padded=count, pid=os.getpid())
+                event = dict(
+                    rows=rows,
+                    padded=count,
+                    local_descriptor=desc.num_tokens,
+                    local_projection_padding=os.environ.get("P_LOCAL_PROJECTION_PADDING") == "1",
+                    pid=os.getpid(),
+                )
                 _events.append(event)
                 print("P_TARGET_EAGER_ALIGNMENT " + json.dumps(event), flush=True)
         return desc, sync
@@ -82,7 +90,9 @@ def install():
 
     @functools.wraps(original_execute)
     def execute(self, *args, **kwargs):
-        global _step_dummy, _in_execute, _target_config
+        global _step_dummy, _in_execute, _target_config, _minimum_alignment
+        speculative = self.vllm_config.speculative_config
+        _minimum_alignment = speculative.num_speculative_tokens + 1 if speculative else 1
         if _target_config is None:
             _target_config = get_ascend_config().finegrained_tp_config
         previous = _step_dummy
@@ -113,6 +123,8 @@ def install():
 
     @functools.wraps(original_prepare)
     def prepare(self, scheduler_output, req_state, desc):
+        if os.environ.get("P_LOCAL_PROJECTION_PADDING") == "1":
+            return original_prepare(self, scheduler_output, req_state, desc)
         if enabled() and desc.cg_mode == CUDAGraphMode.NONE:
             if desc.num_tokens != _last_aligned:
                 raise RuntimeError("P target descriptor lost its uniform row count")
@@ -207,6 +219,7 @@ def evidence():
     return dict(
         events=_events,
         last_aligned_rows=_last_aligned,
+        local_projection_padding=os.environ.get("P_LOCAL_PROJECTION_PADDING") == "1",
         finite_events=_finite_events,
         draft_adapter="main_only_scope",
         additional_collectives=0,
