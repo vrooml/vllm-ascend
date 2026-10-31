@@ -72,6 +72,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Enable external CANN QSFA for packed INT8, RoPE0 attention without LSE
+    # on A3. Requires a PR14492-compatible operator package in the vendor path.
+    # Valid values: "0" (default, disabled), "1" (enabled); not sensitive.
+    # Read once by the native adapter; set before starting worker processes.
+    "VLLM_ASCEND_QSFA_PR14492_A3": lambda: os.getenv("VLLM_ASCEND_QSFA_PR14492_A3", "0") == "1",
 }
 
 # end-env-vars-definition

@@ -16,6 +16,8 @@
 #ifndef KV_QUANT_SPARSE_FLASH_ATTENTION_VLLM_TORCH_ADPT_H
 #define KV_QUANT_SPARSE_FLASH_ATTENTION_VLLM_TORCH_ADPT_H
 
+#include <cstdlib>
+
 namespace vllm_ascend {
 
 namespace {
@@ -131,6 +133,39 @@ npu_kv_quant_sparse_flash_attention_vllm(
 
     char *layout_query_ptr = const_cast<char *>(layout_query_str.c_str());
     char *layout_kv_ptr = const_cast<char *>(layout_kv_str.c_str());
+
+#ifdef VLLM_ASCEND_QSFA_PR14492_A3
+    // The PR #14492 V1 kernel implements packed INT8 RoPE0 without LSE.
+    // Preserve the existing Vllm entry point for LSE and other contracts.
+    static const bool enable_pr14492_a3 = []() {
+        const char *value = std::getenv("VLLM_ASCEND_QSFA_PR14492_A3");
+        return value != nullptr && value[0] == '1' && value[1] == '\0';
+    }();
+    constexpr int64_t INT8_PER_TILE = 2;
+    constexpr int64_t LATENT_HEAD_DIM = 512;
+    constexpr int64_t PACKED_HEAD_BYTES = 528;
+    constexpr int64_t QUANT_TILE_SIZE = 128;
+    constexpr int64_t CAUSAL_SPARSE_MODE = 3;
+    if (enable_pr14492_a3 && !return_softmax_lse && rope_head_dim == 0 &&
+        key_quant_mode == INT8_PER_TILE && value_quant_mode == INT8_PER_TILE &&
+        key.scalar_type() == at::kChar && value.scalar_type() == at::kChar &&
+        query.size(-1) == LATENT_HEAD_DIM && key.size(-1) == PACKED_HEAD_BYTES &&
+        value.size(-1) == PACKED_HEAD_BYTES && layout_kv_str == "PA_BSND" &&
+        tile_size == QUANT_TILE_SIZE && quant_scale_repo_mode == 1 &&
+        sparse_block_size == 1 && sparse_mode == CAUSAL_SPARSE_MODE &&
+        attention_mode == 2) {
+        EXEC_NPU_CMD(
+            aclnnKvQuantSparseFlashAttention,
+            query, key, value, sparse_indices, key_dequant_scale,
+            value_dequant_scale, block_table, actual_seq_lengths_query,
+            actual_seq_lengths_kv, scale_value, key_quant_mode, value_quant_mode,
+            sparse_block_size, layout_query_ptr, layout_kv_ptr, sparse_mode,
+            pre_tokens, next_tokens, attention_mode, quant_scale_repo_mode,
+            tile_size, rope_head_dim, attention_output);
+        return std::tuple<at::Tensor, at::Tensor, at::Tensor>(
+            attention_output, softmax_max, softmax_sum);
+    }
+#endif
 
     EXEC_NPU_CMD(
         aclnnKvQuantSparseFlashAttentionVllm,
