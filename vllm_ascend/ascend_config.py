@@ -1358,6 +1358,11 @@ class FinegrainedTPConfig:
 
         vc = vllm_config
         enabled_configs = []
+        prefill_only = (
+            vc.kv_transfer_config is not None
+            and vc.kv_transfer_config.is_kv_producer
+            and not vc.kv_transfer_config.is_kv_consumer
+        )
         if self.oproj_tensor_parallel_size > 1 or self.mlp_tensor_parallel_size > 1:
             # o_proj's _forward_o_proj reshape misaligns under tp > 1; mlp is untested there.
             if vc.parallel_config.tensor_parallel_size > 1:
@@ -1366,15 +1371,14 @@ class FinegrainedTPConfig:
                     "require tensor_parallel_size == 1, got "
                     f"{vc.parallel_config.tensor_parallel_size}."
                 )
-            # Graph dispatch is the only lane that aligns DP token counts (eager keeps per-rank counts).
-            if vc.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
+            # D uses graph-aligned rows; P pads only the custom projection inputs.
+            if not prefill_only and vc.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
                 raise AssertionError(
                     "oproj_tensor_parallel_size / mlp_tensor_parallel_size are only supported in graph mode"
                 )
-            if vc.kv_transfer_config is None or not vc.kv_transfer_config.is_kv_consumer:
+            if not prefill_only and (vc.kv_transfer_config is None or not vc.kv_transfer_config.is_kv_consumer):
                 raise AssertionError(
-                    "oproj_tensor_parallel_size / mlp_tensor_parallel_size are only supported "
-                    "in pd scenario and can only be used in D node."
+                    "oproj_tensor_parallel_size / mlp_tensor_parallel_size are only supported in PD scenarios."
                 )
             # PCP's dispatch recomputes num_tokens per rank, breaking the group-uniform step size.
             if vc.parallel_config.prefill_context_parallel_size > 1:
@@ -1396,7 +1400,7 @@ class FinegrainedTPConfig:
                 capture_sizes = vc.compilation_config.cudagraph_capture_sizes
                 capture_bound = max(capture_sizes) if capture_sizes else None
             # A step beyond the capture bound dispatches to eager and desyncs the cross-DP collectives.
-            if capture_bound is None or capture_bound < max_step:
+            if not prefill_only and (capture_bound is None or capture_bound < max_step):
                 logger.warning(
                     "Disabling oproj_tensor_parallel_size=%d and mlp_tensor_parallel_size=%d: "
                     "the largest cudagraph capture size (%s) does not cover the largest "

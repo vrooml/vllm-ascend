@@ -275,6 +275,12 @@ class MLPColumnParallelOp(CustomColumnParallelOp):
         bias = self.bias if not self.skip_bias_add else None
         # Matrix multiply.
         assert self.quant_method is not None
+        original_rows = input_.shape[0]
+        input_ = _pad_target_projection_input(input_)
+        if is_forward_context_available():
+            context = get_forward_context()
+            if context.additional_kwargs.get("finegrained_tp_rows") is not None:
+                context.additional_kwargs["finegrained_tp_mlp_rows"][self.prefix.rsplit(".", 1)[0]] = original_rows
         input_parallel = self.comm_group.all_gather(input_, 0)
         output = self.quant_method.apply(self.layer, input_parallel, bias)
 
@@ -297,6 +303,12 @@ class MLPRowParallelOp(CustomRowParallelOp):
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.layer.bias
         output_parallel = self.quant_method.apply(self.layer, input_parallel, bias=bias_)
         output = self.comm_group.reduce_scatter(output_parallel, 0)
+
+        if is_forward_context_available():
+            context = get_forward_context()
+            if context.additional_kwargs.get("finegrained_tp_rows") is not None:
+                original_rows = context.additional_kwargs["finegrained_tp_mlp_rows"].pop(self.prefix.rsplit(".", 1)[0])
+                output = output[:original_rows]
 
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
@@ -347,6 +359,8 @@ class OProjRowParallelOp(CustomRowParallelOp):
         self,
         input_: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        original_rows = input_.shape[0]
+        input_ = _pad_target_projection_input(input_)
         input_parallel = self.get_input_parallel(input_)
 
         # Prepare tensors for all-to-all communication
@@ -373,6 +387,7 @@ class OProjRowParallelOp(CustomRowParallelOp):
         # otp-specific: Combine partial results across devices
         output = self.comm_group.reduce_scatter(output_parallel, dim=0)
         output = output.view(input_.shape[0], self.layer.output_size)
+        output = output[:original_rows]
 
         # Handle bias return based on configuration
         output_bias = self.bias if self.skip_bias_add else None
@@ -382,6 +397,27 @@ class OProjRowParallelOp(CustomRowParallelOp):
         super().update_attrs()
         self.input_is_parallel = self.layer.input_is_parallel
         self.input_size_per_partition = self.layer.input_size_per_partition
+
+
+def _pad_target_projection_input(input_: torch.Tensor) -> torch.Tensor:
+    if not is_forward_context_available():
+        return input_
+    context = get_forward_context()
+    rows = context.additional_kwargs.get("finegrained_tp_rows")
+    if rows is None or context.additional_kwargs.get("capturing", False):
+        return input_
+    num_actual_tokens, aligned_rows = rows
+    local_rows = input_.shape[0]
+    if local_rows > aligned_rows:
+        raise RuntimeError("Projection rows exceed the DP token-row agreement")
+    if local_rows < aligned_rows:
+        input_ = torch.nn.functional.pad(input_, (0, 0, 0, aligned_rows - local_rows))
+    elif num_actual_tokens < local_rows:
+        input_ = input_.clone()
+    # An idle peer has zero valid rows. Do not send stale or NaN dummy values.
+    if num_actual_tokens < input_.shape[0]:
+        input_[num_actual_tokens:].zero_()
+    return input_
 
 
 class ShardedCPColumnParallelOp(CustomColumnParallelOp):
