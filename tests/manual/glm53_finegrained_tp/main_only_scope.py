@@ -5,7 +5,7 @@ constructor and capture/propose calls therefore run with all fine-grained TP
 knobs disabled. Target configuration is restored in ``finally`` blocks.
 
 Embedding and LM Head normally alias the target modules. When either target
-module is sharded differently, this adapter keeps an independent TP2 draft
+module is sharded differently, this adapter keeps an independent ordinary-TP draft
 module and reloads the exact baseline target checkpoint slice used by MTP.
 """
 
@@ -14,9 +14,9 @@ import hashlib
 import importlib.abc
 import importlib.machinery
 import json
+import os
 import sys
 from pathlib import Path
-
 
 MTP_MODEL_MODULE = "vllm_ascend.models.glm5next.mtp"
 MTP_SPECULATOR_MODULE = "vllm_ascend.worker.v2.spec_decode.mtp.speculator"
@@ -96,6 +96,13 @@ def _load_checkpoint_slice(model_path, key, module):
     from safetensors import safe_open
 
     index, shard = _indexed_weight(model_path, key)
+    manifest_path = os.environ.get("FG_BASELINE_WEIGHT_MANIFEST")
+    if not manifest_path:
+        raise RuntimeError("MTP isolation requires FG_BASELINE_WEIGHT_MANIFEST")
+    manifest = json.loads(Path(manifest_path).read_text())["weights"][key]
+    if manifest["checkpoint_key"] != key or manifest["baseline_tp"] != module.tp_size:
+        raise RuntimeError(f"Baseline reference disagrees with the TP layout for {key}")
+    shard = manifest["checkpoint_shard"]
     if module.tp_size <= 0 or module.num_embeddings % module.tp_size:
         raise RuntimeError(f"Unsupported TP layout for {key}")
     if module.num_embeddings_padded != module.num_embeddings:
@@ -111,9 +118,12 @@ def _load_checkpoint_slice(model_path, key, module):
         part = source[start:end, :].contiguous()
     if part.shape != module.weight.shape or part.dtype != module.weight.dtype:
         raise RuntimeError(f"Loaded TP shard mismatch for {key}")
+    source_hash = _tensor_digest(part)
+    expected = manifest["tp_shard_sha256"][str(module.tp_rank)]
+    if source_hash != expected:
+        raise RuntimeError(f"Source differs from the actual loaded baseline for {key}")
     with torch.no_grad():
         module.weight.copy_(part)
-    source_hash = _tensor_digest(part)
     loaded_hash = _tensor_digest(module.weight.detach().cpu())
     if source_hash != loaded_hash:
         raise RuntimeError(f"Bytewise checkpoint verification failed for {key}")
@@ -127,6 +137,7 @@ def _load_checkpoint_slice(model_path, key, module):
         "shape": list(module.weight.shape),
         "source_sha256": source_hash,
         "loaded_sha256": loaded_hash,
+        "baseline_manifest": manifest_path,
     }
 
 

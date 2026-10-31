@@ -10,8 +10,22 @@ GLM-5.3-Flash A3 W8A8 experiments.
   Embedding collective at the same input-preparation point as active ranks.
 - `main_only_scope.py` is a test-only adapter. It disables all fine-grained TP
   knobs while constructing and executing MTP. For Embedding and LM Head it
-  prevents target/draft module aliasing, reloads the original TP2 checkpoint
+  prevents target/draft module aliasing, reloads the original ordinary-TP checkpoint
   slice, and verifies the loaded bytes before a request is run.
+
+For mixed-export weight directories, an index alone does not identify the
+values that the normal loader ultimately loaded. Record every loaded MTP
+parameter's SHA256 with fine-grained TP disabled. If target Embedding or LM Head
+sharding requires an independent MTP copy, set `FG_BASELINE_WEIGHT_MANIFEST` to a
+JSON file with a `weights` mapping keyed by checkpoint tensor name. Each entry
+contains `checkpoint_key`, `checkpoint_shard`, `baseline_tp`, and
+`tp_shard_sha256` (TP-rank strings mapped to the actual baseline shard hashes).
+The adapter rejects a source that does not match that reference. Compare the
+complete loaded MTP parameter manifest again before issuing test requests.
+The GLM validation directory contained both 81- and 82-shard exports; the
+indexed 82-shard Embedding differed from the loaded 81-shard baseline Embedding.
+The baseline LM Head came from the 82-shard export. Select each tensor by its
+actual loaded hashes, rather than choosing one export for the whole model.
 
 The adapter is not installed by the package and must be imported and installed
 by the validation launcher before either GLM5Next MTP module is imported.
