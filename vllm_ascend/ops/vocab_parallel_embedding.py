@@ -23,10 +23,10 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.nn.parameter import Parameter
-from vllm.config import get_current_vllm_config
+from vllm.config import CUDAGraphMode, get_current_vllm_config
 from vllm.distributed import divide
 from vllm.distributed.parallel_state import get_pcp_group, get_tp_group
-from vllm.forward_context import is_forward_context_available
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
@@ -42,6 +42,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.parallel_state import (
     GroupCoordinator,
     get_embed_tp_group,
@@ -190,6 +191,11 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
         self.parallel_mode = plan.mode
         self.token_exchange_group = plan.token_exchange_group
         self.output_reduce_group = plan.output_reduce_group
+        self.dynamic_embedding_padding = (
+            plan.mode == VocabParallelMode.FINE_GRAINED
+            and plan.token_exchange_group is not None
+            and get_ascend_config().embedding_tp_dynamic_padding is True
+        )
         # tp_rank/tp_size describe the logical weight layout. For PCP_X_TP that
         # layout spans two real communication groups rather than one TP group.
         self.tp_rank = plan.shard_rank
@@ -338,6 +344,8 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
         capacity = self.embedding_tp_capacity
         assert capacity is not None
         exchange_tokens = capacity
+        if self.parallel_mode == VocabParallelMode.FINE_GRAINED and self.dynamic_embedding_padding:
+            exchange_tokens = self._finegrained_exchange_tokens(num_tokens, capacity)
         # PCP ranks share one batch's padded length. Fine-grained embedding
         # TP spans DP ranks with independent batches, so it uses the capacity.
         if self.parallel_mode == VocabParallelMode.PCP_X_TP:
@@ -386,6 +394,29 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
             # reduction completes the vocabulary result across TP shards.
             output = torch.ops.vllm.all_reduce(output, reduce_group.unique_name)
         return output
+
+    def _finegrained_exchange_tokens(self, num_tokens: int, capacity: int) -> int:
+        """Agree a bounded bucket using CPU metadata, never an NPU scalar read.
+
+        FULL replay uses a group-agreed graph descriptor. Its captured
+        collective size must depend only on that descriptor, not mutable state
+        left by another graph. Eager/MM lookup instead agrees the current
+        row count over this layer's CPU group, including empty ranks.
+        """
+        if torch.compiler.is_compiling():
+            raise RuntimeError("embedding_tp_dynamic_padding requires Embedding lookup outside torch.compile.")
+        in_full_graph = (
+            is_forward_context_available() and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL
+        )
+        if in_full_graph:
+            group_tokens = num_tokens
+        else:
+            rows = torch.tensor([num_tokens], dtype=torch.int64, device="cpu")
+            dist.all_reduce(rows, op=dist.ReduceOp.MAX, group=self.token_exchange_group.cpu_group)
+            group_tokens = int(rows[0])
+        if group_tokens > capacity:
+            raise ValueError(f"Embedding group has {group_tokens} rows, exceeding capacity {capacity}.")
+        return min(capacity, 1 << (max(1, group_tokens) - 1).bit_length())
 
     def _forward_standard(self, input_):
         if self.tp_size > 1:

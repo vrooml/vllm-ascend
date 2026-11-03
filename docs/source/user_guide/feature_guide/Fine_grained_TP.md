@@ -102,6 +102,37 @@ Fine-grained TP shards the configured layer **across the data-parallel (DP) dime
 
 ### Usage Example
 
+#### Group-local Embedding padding on Model Runner V2
+
+Set `embedding_tp_dynamic_padding` together with Embedding fine-grained TP:
+
+```json
+{
+    "finegrained_tp_config": {"embedding_tensor_parallel_size": 4},
+    "embedding_tp_dynamic_padding": true
+}
+```
+
+Each Embedding group agrees on its maximum current token count and rounds it
+up to a power-of-two bucket, capped at the configured exchange capacity.
+For example, group token counts `[60, 30, 10, 0]` use 64 rows per rank instead
+of 16384. AllGather therefore carries 256 IDs and ReduceScatter carries
+`[256, hidden_size]` embeddings. Returned tensors retain each caller's original
+token count. Empty ranks participate with padding rows.
+
+When MC2 permits independent DP execution, graph dispatch agrees on graph mode
+and batch shape within the Embedding group. FULL graph replay uses the agreed
+descriptor; eager execution exchanges current counts over the group's CPU
+communicator. Target and MTP Embedding use the same exchange contract.
+Text targets use MRV2's precomputed `inputs_embeds` path, including dummy and
+capture inputs. The text draft runner also evaluates Embedding before its
+compiled model forward. CPU bucket agreement therefore stays outside
+`torch.compile`; draft FULL ACL capture still records the NPU lookup and
+collectives. Draft layers and sampling remain unchanged.
+This option does not support microbatching. Its default is `false`, preserving
+fixed-capacity Embedding exchanges. PCP vocabulary sharding uses its existing
+token-exchange path.
+
 #### Scenario 1 — embedding + LM head TP, stacked with standard TP (standalone MoE serving)
 
 ```bash

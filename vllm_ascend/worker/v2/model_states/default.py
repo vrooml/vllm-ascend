@@ -404,6 +404,8 @@ class AscendModelState(DefaultModelState):
 
     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
         model_inputs = super().prepare_dummy_inputs(num_reqs, num_tokens)
+        if getattr(self, "dynamic_embedding_inputs", False):
+            model_inputs["inputs_embeds"] = self.dummy_inputs_embeds(num_tokens)
         model_inputs.update(self.prepare_engram_dummy_inputs(num_reqs, num_tokens))
         return model_inputs
 

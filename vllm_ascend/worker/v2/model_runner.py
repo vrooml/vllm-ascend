@@ -116,6 +116,7 @@ from vllm_ascend.worker.v2.attn_utils import (
     build_attn_state,
     skip_ring_state_update,
 )
+from vllm_ascend.worker.v2.embedding_dp_utils import enable_target_embedding_inputs
 from vllm_ascend.worker.v2.eplb import AscendEPLBController
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.kv_connector import MambaCopyKVConnector
@@ -315,6 +316,7 @@ class NPUModelRunner(GPUModelRunner):
         if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
             self._start_dump_data()
         self.model_state.prompt_logprobs_worker = self.prompt_logprobs_worker
+        enable_target_embedding_inputs(self)
 
     def _restore_replicated_draft_target_states(self) -> None:
         """Restore target states consumed by a replicated PCP draft."""
@@ -689,7 +691,7 @@ class NPUModelRunner(GPUModelRunner):
         )
         profile_kwargs = {"randomize_inputs": randomize_inputs}
         forward_failed = True
-        with dp_coordination_context:
+        with dp_coordination_context, _target_embedding_dummy_collective(self):
             try:
                 output = super().execute_model(
                     scheduler_output,
@@ -1498,6 +1500,36 @@ class NPUModelRunner(GPUModelRunner):
         cumulative_padding = np.arange(1, num_padding_reqs + 1, dtype=np.int32) * num_padding_tokens // num_padding_reqs
         query_start_loc_np[num_reqs + 1 : num_reqs_padded + 1] = last_loc + cumulative_padding
         return query_start_loc_np, num_reqs_padded
+
+
+@contextmanager
+def _target_embedding_dummy_collective(runner):
+    """Idle MM ranks join lookup at the same position as real target inputs."""
+    enabled = (
+        runner.ascend_config.finegrained_tp_config.embedding_tensor_parallel_size > 1
+        and runner.uses_inputs_embeds
+        and runner.is_first_pp_rank
+    )
+    if not enabled:
+        yield
+        return
+    state = runner.model_state
+    had_instance_method = "dummy_inputs_embeds" in state.__dict__
+    previous_instance_method = state.__dict__.get("dummy_inputs_embeds")
+    original = state.dummy_inputs_embeds
+
+    def join_target_embedding(num_tokens):
+        runner.model.embed_input_ids(runner.input_buffers.input_ids[:num_tokens])
+        return original(num_tokens)
+
+    state.dummy_inputs_embeds = join_target_embedding
+    try:
+        yield
+    finally:
+        if had_instance_method:
+            state.dummy_inputs_embeds = previous_instance_method
+        else:
+            del state.dummy_inputs_embeds
 
 
 @contextmanager

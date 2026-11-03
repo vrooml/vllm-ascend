@@ -27,6 +27,7 @@ import torch
 from vllm.config import VllmConfig, replace, set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import get_dcp_group
+from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -492,7 +493,14 @@ class AscendTargetDependentARSpeculator(LmheadTPDraftSamplingMixin, TargetDepend
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Override the upstream AR speculator._run_model for Ascend NPUs."""
-        last_hidden_states, hidden_states = super()._run_model(
+        config = get_ascend_config()
+        external_embedding = (
+            getattr(config, "embedding_tp_dynamic_padding", False) is True
+            and config.finegrained_tp_config.embedding_tensor_parallel_size > 1
+            and not self.supports_mm_inputs
+        )
+        run_model = self._run_model_with_embedding if external_embedding else super()._run_model
+        last_hidden_states, hidden_states = run_model(
             num_tokens,
             attn_metadata,
             slot_mappings,
@@ -503,6 +511,51 @@ class AscendTargetDependentARSpeculator(LmheadTPDraftSamplingMixin, TargetDepend
         return AscendPCPManager.broadcast_replicated_hidden_states(
             last_hidden_states, hidden_states, num_tokens, replicated_pcp=self.replicated_pcp
         )
+
+    def _run_model_with_embedding(
+        self,
+        num_tokens: int,
+        attn_metadata,
+        slot_mappings,
+        num_tokens_across_dp,
+        cudagraph_runtime_mode: CUDAGraphMode,
+        mm_inputs=None,
+    ):
+        """Keep group-size agreement outside the compiled text draft forward.
+
+        FULL ACL capture still records the lookup and its NPU collectives.
+        Only the embedding/compiled-model boundary changes; draft layers,
+        sampling, and speculative step count retain their existing contract.
+        """
+        assert mm_inputs is None
+        input_buffers = self.input_buffers
+        is_padding = None
+        if self.pcp_manager is not None:
+            input_buffers = self.pcp_manager.get_draft_input_buffers(input_buffers)
+            is_padding = input_buffers.is_padding[:num_tokens]
+        with set_forward_context(
+            attn_metadata,
+            self.vllm_config,
+            num_tokens=num_tokens,
+            cudagraph_runtime_mode=cudagraph_runtime_mode,
+            num_tokens_across_dp=num_tokens_across_dp,
+            slot_mapping=slot_mappings,
+            batch_descriptor=BatchDescriptor(num_tokens=num_tokens),
+            is_padding=is_padding,
+        ):
+            input_ids = input_buffers.input_ids[:num_tokens]
+            model_inputs = dict(
+                input_ids=input_ids,
+                positions=input_buffers.positions[:num_tokens],
+                hidden_states=self.hidden_states[:num_tokens],
+                inputs_embeds=self.model.embed_input_ids(input_ids),
+            )
+            if cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
+                assert self.prefill_cudagraph_manager is not None
+                result = self.prefill_cudagraph_manager.run_pw_graph(self.model, model_inputs)
+            else:
+                result = self.model(**model_inputs)
+        return result if isinstance(result, tuple) else (result, result)
 
     def _generate_draft(
         self,

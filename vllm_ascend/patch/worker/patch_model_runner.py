@@ -5,10 +5,10 @@ from contextlib import AbstractContextManager
 
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu import model_runner as upstream
-from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp as _dispatch_cg_and_sync_dp
 
 from vllm_ascend.attention.context_parallel.common_cp import is_pcp_decode_sharding_enabled
 from vllm_ascend.worker.utils import copy_kv_cache_blocks_inplace
+from vllm_ascend.worker.v2.embedding_dp_utils import dispatch_cg_and_sync_dp as _dispatch_cg_and_sync_dp
 
 
 # TODO: Remove once upstream GPUModelRunner dispatches sharded PCP decode with

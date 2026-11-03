@@ -28,6 +28,16 @@
 
 # What's Patched and how it works:
 # --------------------------------
+# * worker/patch_model_runner.py and worker/patch_eagle_speculator.py:
+#   Target: MRV2 target and autoregressive speculator graph-dispatch bindings.
+#   Why: DP-axis Embedding exchanges require matching shapes and graph modes
+#        inside each Embedding group even when MC2 skips global DP agreement.
+#   How: Delegate to group-local agreement only when embedding_tp_dynamic_padding
+#        is enabled; preserve upstream dispatch for other execution paths.
+#   Related PR: Upstream dispatch has no layer-specific process-group hook.
+#   Future plan: Remove these bindings when upstream dispatch accepts a backend
+#                group-agreement hook for layers with cross-DP collectives.
+# --------------------------------
 # * worker/patch_kda_recoverssm.py:
 #   Target: Kimi KDA's KDARecoverSSMCommitContext module binding.
 #   Why: The upstream metadata builder imports its CUDA context directly.
