@@ -682,6 +682,7 @@ class NPUPlatform(Platform):
             _is_decode_only_node,
             get_mc2_mask,
             get_mrv2_in_profile_run,
+            get_target_projection_rows,
             select_moe_comm_method,
             sync_v2_extra_kwargs,
             use_cann_megamoe,
@@ -772,6 +773,10 @@ class NPUPlatform(Platform):
             "num_tokens": num_tokens,
             "padded_length": padded_length,
             "max_tokens_across_dp": max_tokens_across_dp,
+            "finegrained_tp_rows": get_target_projection_rows(
+                vllm_config, dp_metadata, max_tokens_across_dp, cudagraph_runtime_mode, is_draft_model
+            ),
+            "finegrained_tp_mlp_rows": {},
             "max_tokens_across_pcp": max_tokens_across_pcp,
             "mc2_mask": mc2_mask,
             "is_draft_model": is_draft_model,

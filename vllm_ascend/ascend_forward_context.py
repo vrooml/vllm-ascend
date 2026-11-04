@@ -47,6 +47,43 @@ class MoECommType(Enum):
 
 _MRV2_IN_PROFILE_RUN: ContextVar[bool] = ContextVar("_MRV2_IN_PROFILE_RUN", default=False)
 
+# Scoped to one target execute_model call; nested draft forwards do not use it.
+_MRV2_TARGET_ROWS: ContextVar[tuple[int, int] | None] = ContextVar("_MRV2_TARGET_ROWS", default=None)
+
+
+@contextmanager
+def override_mrv2_target_rows(num_tokens: int | None, minimum_rows: int = 1):
+    rows = None if num_tokens is None else (num_tokens, minimum_rows)
+    token = _MRV2_TARGET_ROWS.set(rows)
+    try:
+        yield
+    finally:
+        _MRV2_TARGET_ROWS.reset(token)
+
+
+def get_target_projection_rows(
+    vllm_config, dp_metadata, max_tokens_across_dp, cudagraph_runtime_mode, is_draft_model=False
+):
+    rows = _MRV2_TARGET_ROWS.get()
+    if rows is None or is_draft_model:
+        return None
+    kv_config = vllm_config.kv_transfer_config
+    finegrained = get_ascend_config().finegrained_tp_config
+    if (
+        kv_config is None
+        or not kv_config.is_kv_producer
+        or kv_config.is_kv_consumer
+        or cudagraph_runtime_mode != CUDAGraphMode.NONE
+        or not (finegrained.oproj_tensor_parallel_size > 1 or finegrained.mlp_tensor_parallel_size > 1)
+    ):
+        return None
+    if dp_metadata is None:
+        raise RuntimeError("Prefill OProj/MLP TP requires DP token-row coordination")
+    # max_tokens_across_dp comes from the existing CPU-side DP agreement.
+    # Keep the local descriptor unchanged so attention and MoE stay unpadded.
+    num_actual_tokens, minimum_rows = rows
+    return num_actual_tokens, max(int(max_tokens_across_dp), minimum_rows)
+
 
 _MEGA_MOE_TOKENS_PER_RANK_LIMIT = 16384
 _DISPATCH_FFN_COMBINE_TOKENS_PER_RANK_LIMIT = 512
