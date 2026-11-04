@@ -37,10 +37,32 @@ def validate_glm_recoverssm(vllm_config: VllmConfig) -> None:
     if parallel.decode_context_parallel_size != 1:
         raise ValueError("GLM RecoverSSM currently requires DCP=1")
     transfer = vllm_config.kv_transfer_config
-    if transfer is not None and transfer.kv_connector not in ("MooncakeConnectorV2", "MooncakePullConnector"):
+    if transfer is not None and not _supports_recoverssm_transfer(transfer):
         raise ValueError("GLM RecoverSSM KV transfer requires MooncakeConnectorV2 or MooncakePullConnector")
     if parallel.prefill_context_parallel_size > 1:
         if parallel.tensor_parallel_size != 1:
             raise ValueError("GLM RecoverSSM PCP requires TP=1")
         if transfer is None or transfer.kv_role != "kv_producer":
             raise ValueError("GLM RecoverSSM PCP requires a Mooncake KV producer")
+
+
+def _supports_recoverssm_transfer(transfer) -> bool:
+    """Accept Mooncake transport plus the consumer's hybrid-state CPU store."""
+    name = transfer.kv_connector
+    mooncake = ("MooncakeConnectorV2", "MooncakePullConnector")
+    if name in mooncake:
+        return True
+    # MultiConnector constructs per-child VllmConfig copies, which validate again.
+    # This store preserves both recurrent and convolution Mamba cache tensors.
+    if name == "PreemptOffloadConnector":
+        return transfer.kv_role == "kv_consumer"
+    if name != "MultiConnector" or transfer.kv_role != "kv_consumer":
+        return False
+    children = transfer.kv_connector_extra_config.get("connectors", [])
+    names = [child.get("kv_connector") for child in children]
+    return (
+        sum(name in mooncake for name in names) == 1
+        and names.count("PreemptOffloadConnector") == 1
+        and len(names) == 2
+        and all(child.get("kv_role", transfer.kv_role) == "kv_consumer" for child in children)
+    )

@@ -135,3 +135,32 @@ def test_other_models_and_disabled_switch_keep_upstream_validation(monkeypatch):
     config.cache_config.use_replayssm = False
     assert patch_replayssm_config.validate_mamba_cached_kernel(config) is config
     assert called == [config, config]
+
+
+@pytest.mark.parametrize("connector", ["MooncakeConnectorV2", "MooncakePullConnector"])
+def test_recoverssm_consumer_multi_and_revalidated_children(connector):
+    config = make_config()
+    children = [dict(kv_connector=connector, kv_role="kv_consumer"),
+                dict(kv_connector="PreemptOffloadConnector", kv_role="kv_consumer")]
+    config.kv_transfer_config = SimpleNamespace(
+        kv_connector="MultiConnector", kv_role="kv_consumer",
+        kv_connector_extra_config={"connectors": children})
+    validate_glm_recoverssm(config)
+    for child in children:
+        config.kv_transfer_config = SimpleNamespace(**child)
+        validate_glm_recoverssm(config)
+
+
+@pytest.mark.parametrize("names,role", [
+    (["MooncakeConnectorV2"], "kv_consumer"),
+    (["PreemptOffloadConnector"], "kv_consumer"),
+    (["MooncakeConnectorV2", "AscendStoreConnector"], "kv_consumer"),
+    (["MooncakeConnectorV2", "PreemptOffloadConnector"], "kv_producer"),
+])
+def test_recoverssm_rejects_other_multi_compositions(names, role):
+    config = make_config()
+    config.kv_transfer_config = SimpleNamespace(
+        kv_connector="MultiConnector", kv_role=role,
+        kv_connector_extra_config={"connectors": [dict(kv_connector=n, kv_role=role) for n in names]})
+    with pytest.raises(ValueError, match="requires Mooncake"):
+        validate_glm_recoverssm(config)
