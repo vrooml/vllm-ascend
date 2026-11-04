@@ -585,6 +585,9 @@ class AscendConfig:
     enable_force_eplb: bool = False
     enable_pcp_o_proj_weight_sharding: bool = True
     enable_pcp_embedding_lmhead_weight_sharding: bool = True
+    # Coordinate DP-axis Embedding rows within its fine-grained group and
+    # exchange the next power-of-two bucket instead of scheduler capacity.
+    embedding_tp_dynamic_padding: bool = False
     draft_window_size: int | None = None
     mix_placement: bool = False
     # When non-zero, force the MC2 combine stage's comm quant_mode to this

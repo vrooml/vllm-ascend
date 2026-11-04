@@ -2,12 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import pytest
 import torch
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import (
@@ -22,11 +23,49 @@ from vllm_ascend.distributed.eplb.tensor_ops import make_allgather_mask
 from vllm_ascend.utils import vllm_version_is
 from vllm_ascend.worker.v2.input_batch import AscendInputBuffers
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
+from vllm_ascend.worker.v2.spec_decode.target_dependent_ar import speculator as speculator_module
 from vllm_ascend.worker.v2.spec_decode.target_dependent_ar.speculator import (
     AscendTargetDependentARSpeculator,
     gather,
     torch_gather_wrapper,
 )
+
+
+@pytest.mark.parametrize("mode", [CUDAGraphMode.NONE, CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE])
+@pytest.mark.parametrize("num_tokens", [0, 3])
+def test_dynamic_embedding_stays_outside_compiled_draft(monkeypatch, mode, num_tokens):
+    """Text MTP lookup runs in the forward context before fullgraph compilation."""
+    active = []
+
+    @contextmanager
+    def context(*args, **kwargs):
+        active.append(kwargs)
+        yield
+        active.pop()
+
+    class Draft(torch.nn.Module):
+        @torch.compiler.disable
+        def embed_input_ids(self, ids):
+            assert active[-1]["num_tokens"] == num_tokens
+            return ids[:, None].expand(-1, 2).float()
+
+        def forward(self, input_ids, positions, hidden_states, inputs_embeds):
+            assert inputs_embeds is not None
+            return hidden_states + inputs_embeds
+
+    speculator = AscendTargetDependentARSpeculator.__new__(AscendTargetDependentARSpeculator)
+    speculator.input_buffers = SimpleNamespace(input_ids=torch.arange(5), positions=torch.arange(5))
+    speculator.hidden_states = torch.ones(5, 2)
+    speculator.pcp_manager = None
+    speculator.vllm_config = object()
+    speculator.model = torch.compile(Draft(), backend="eager", fullgraph=True)
+    speculator.prefill_cudagraph_manager = SimpleNamespace(run_pw_graph=lambda model, inputs: model(**inputs))
+    monkeypatch.setattr(speculator_module, "set_forward_context", context)
+    result, feedback = speculator._run_model_with_embedding(num_tokens, None, None, None, mode)
+    expected = 1 + torch.arange(num_tokens)[:, None].expand(-1, 2).float()
+    assert torch.equal(result, expected)
+    assert feedback is result
+    assert not active
 
 
 def test_calc_next_seq_lens_cpu():

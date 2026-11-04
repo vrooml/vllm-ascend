@@ -16,11 +16,12 @@
 import unittest
 from types import SimpleNamespace
 from unittest import mock
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import torch
 from torch._dynamo.backends.common import aot_autograd
+from vllm.config import CUDAGraphMode
 from vllm.config.vllm import set_current_vllm_config
 from vllm.forward_context import ForwardContext, override_forward_context
 
@@ -32,6 +33,37 @@ from vllm_ascend.ops.vocab_parallel_embedding import (
     VocabParallelMode,
     _resolve_vocab_parallel_plan,
 )
+
+
+@pytest.mark.parametrize("rows,bucket", [(0, 1), (1, 1), (3, 4), (63, 64), (64, 64), (65, 128), (10000, 16000)])
+def test_finegrained_embedding_bucket(monkeypatch, rows, bucket):
+    layer = object.__new__(AscendVocabParallelEmbedding)
+    group = SimpleNamespace(cpu_group=object())
+    object.__setattr__(layer, "token_exchange_group", group)
+
+    def reduce(count, op, group):
+        assert group is cpu_group
+        assert op == torch.distributed.ReduceOp.MAX
+        count[0] = rows
+
+    cpu_group = group.cpu_group
+    reducer = Mock(side_effect=reduce)
+    monkeypatch.setattr("vllm_ascend.ops.vocab_parallel_embedding.dist.all_reduce", reducer)
+    with override_forward_context(None):
+        assert layer._finegrained_exchange_tokens(0, 16000) == bucket
+    reducer.assert_called_once()
+
+
+def test_finegrained_embedding_full_graph_bucket(monkeypatch):
+    layer = object.__new__(AscendVocabParallelEmbedding)
+    context = ForwardContext({}, {}, {})
+    context.cudagraph_runtime_mode = CUDAGraphMode.FULL
+    reducer = Mock(side_effect=AssertionError("FULL capture must not read mutable group metadata"))
+    monkeypatch.setattr("vllm_ascend.ops.vocab_parallel_embedding.dist.all_reduce", reducer)
+    with override_forward_context(context):
+        assert layer._finegrained_exchange_tokens(60, 16384) == 64
+        assert layer._finegrained_exchange_tokens(12, 16384) == 16
+
 
 VOCAB_PARALLEL_EMBEDDING_TEST_NUM_RANDOM_SEEDS = 128
 
@@ -326,6 +358,7 @@ def _exchange_embedding(monkeypatch, mode, tp_rank=0, tp_size=1, exchange_rank=0
         ("enable_pcp_embedding_lmhead_weight_sharding", mode is VocabParallelMode.PCP_X_TP),
         ("embedding_tp_enable", mode is VocabParallelMode.FINE_GRAINED),
         ("lmhead_tp_enable", False),
+        ("get_ascend_config", SimpleNamespace(embedding_tp_dynamic_padding=False)),
     ):
         monkeypatch.setattr(f"{module}.{name}", lambda value=value: value)
     layer = AscendVocabParallelEmbedding(8, 2, padding_size=4, prefix="model.embed_tokens")
