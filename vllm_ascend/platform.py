@@ -1273,7 +1273,12 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
     offload_missing = kv_transfer_config is None or not kv_transfer_config.has_connector("PreemptOffloadConnector")
     # Only a real split (size > 1) needs the offload guarantee, mirroring the runner gate.
     ftpc = ascend_config.finegrained_tp_config
-    if offload_missing and (ftpc.oproj_tensor_parallel_size > 1 or ftpc.mlp_tensor_parallel_size > 1):
+    prefill_only = (
+        kv_transfer_config is not None
+        and kv_transfer_config.is_kv_producer
+        and not kv_transfer_config.is_kv_consumer
+    )
+    if offload_missing and not prefill_only and (ftpc.oproj_tensor_parallel_size > 1 or ftpc.mlp_tensor_parallel_size > 1):
         raise AssertionError(
             "oproj_tensor_parallel_size / mlp_tensor_parallel_size require PreemptOffloadConnector "
             "(via MultiConnector): a preempted request must not return to the prefill node, "

@@ -47,8 +47,9 @@ class MoECommType(Enum):
 
 _MRV2_IN_PROFILE_RUN: ContextVar[bool] = ContextVar("_MRV2_IN_PROFILE_RUN", default=False)
 
-# Scoped to one target execute_model call; nested draft forwards do not use it.
+# Target and draft forwards have separate, per-call row agreements.
 _MRV2_TARGET_ROWS: ContextVar[tuple[int, int] | None] = ContextVar("_MRV2_TARGET_ROWS", default=None)
+_MRV2_DRAFT_ROWS: ContextVar[tuple[int, int] | None] = ContextVar("_MRV2_DRAFT_ROWS", default=None)
 
 
 @contextmanager
@@ -61,9 +62,49 @@ def override_mrv2_target_rows(num_tokens: int | None, minimum_rows: int = 1):
         _MRV2_TARGET_ROWS.reset(token)
 
 
+@contextmanager
+def override_mrv2_draft_rows(
+    vllm_config, num_tokens, num_tokens_across_dp, cudagraph_runtime_mode, *, is_dummy=False, runtime_batch=True
+):
+    """Align only P's eager draft projections using this draft forward's DP agreement."""
+    kv_config = vllm_config.kv_transfer_config
+    finegrained = get_ascend_config().finegrained_tp_config
+    rows = None
+    if (
+        runtime_batch
+        and not get_mrv2_in_profile_run()
+        and kv_config is not None
+        and kv_config.is_kv_producer
+        and not kv_config.is_kv_consumer
+        and cudagraph_runtime_mode == CUDAGraphMode.NONE
+        and (finegrained.oproj_tensor_parallel_size > 1 or finegrained.mlp_tensor_parallel_size > 1)
+    ):
+        if num_tokens_across_dp is None:
+            raise RuntimeError("Prefill draft OProj/MLP TP requires DP token-row coordination")
+        speculative = vllm_config.speculative_config
+        minimum_rows = speculative.num_speculative_tokens + 1 if speculative else 1
+        aligned_rows = max(int(num_tokens_across_dp.max().item()), minimum_rows)
+        if num_tokens > aligned_rows:
+            raise RuntimeError("Draft projection rows exceed the DP token-row agreement")
+        rows = (0 if is_dummy else num_tokens, aligned_rows)
+    draft_token = _MRV2_DRAFT_ROWS.set(rows)
+    target_token = _MRV2_TARGET_ROWS.set(None)
+    try:
+        yield
+    finally:
+        _MRV2_TARGET_ROWS.reset(target_token)
+        _MRV2_DRAFT_ROWS.reset(draft_token)
+
+
 def get_target_projection_rows(
     vllm_config, dp_metadata, max_tokens_across_dp, cudagraph_runtime_mode, is_draft_model=False
 ):
+    # KV connector control contexts do not execute a model or agree token rows.
+    if max_tokens_across_dp is None:
+        return None
+    draft_rows = _MRV2_DRAFT_ROWS.get()
+    if draft_rows is not None:
+        return draft_rows
     rows = _MRV2_TARGET_ROWS.get()
     if rows is None or is_draft_model:
         return None

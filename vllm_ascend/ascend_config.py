@@ -785,7 +785,13 @@ class AscendConfig:
             self.finegrained_tp_config.oproj_tensor_parallel_size > 1
             or self.finegrained_tp_config.mlp_tensor_parallel_size > 1
         )
-        if finegrained_tp_enabled and not self.scheduler_config.recompute_scheduler_enable:
+        prefill_only = (
+            vc.kv_transfer_config is not None
+            and vc.kv_transfer_config.is_kv_producer
+            and not vc.kv_transfer_config.is_kv_consumer
+        )
+        # P aligns projection rows through DP coordination; only D needs decode-shaped steps.
+        if finegrained_tp_enabled and not prefill_only and not self.scheduler_config.recompute_scheduler_enable:
             raise AssertionError(
                 "oproj_tensor_parallel_size / mlp_tensor_parallel_size require "
                 "recompute_scheduler_enable=true: it keeps decode-node steps decode-shaped.",

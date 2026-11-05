@@ -42,6 +42,7 @@ from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import (
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.ascend_forward_context import override_mrv2_draft_rows
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.context_parallel.attention_cp import build_dcp_fia_params
 from vllm_ascend.attention.context_parallel.common_cp import CPKVScope
@@ -506,14 +507,22 @@ class AscendTargetDependentARSpeculator(LmheadTPDraftSamplingMixin, TargetDepend
             and not self.supports_mm_inputs
         )
         run_model = self._run_model_with_embedding if external_embedding else super()._run_model
-        last_hidden_states, hidden_states = run_model(
+        with override_mrv2_draft_rows(
+            self.vllm_config,
             num_tokens,
-            attn_metadata,
-            slot_mappings,
             num_tokens_across_dp,
             cudagraph_runtime_mode,
-            mm_inputs,
-        )
+            is_dummy=self._eplb_dummy_run,
+            runtime_batch=self.input_batch is not None,
+        ):
+            last_hidden_states, hidden_states = run_model(
+                num_tokens,
+                attn_metadata,
+                slot_mappings,
+                num_tokens_across_dp,
+                cudagraph_runtime_mode,
+                mm_inputs,
+            )
         return AscendPCPManager.broadcast_replicated_hidden_states(
             last_hidden_states, hidden_states, num_tokens, replicated_pcp=self.replicated_pcp
         )
