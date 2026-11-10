@@ -4,7 +4,6 @@ from types import SimpleNamespace
 
 import pytest
 from vllm.config import CacheConfig
-
 from vllm_ascend.models.glm5next.recoverssm_config import use_glm_recoverssm, validate_glm_recoverssm
 from vllm_ascend.patch.platform import patch_replayssm_config
 
@@ -40,7 +39,10 @@ def test_default_does_not_change_native_cache_contract():
     assert not config.cache_config.use_kda_recoverssm
 
 
-@pytest.mark.parametrize("connector", [None, "MooncakeConnectorV2", "MooncakePullConnector"])
+@pytest.mark.parametrize(
+    "connector",
+    [None, "MooncakeConnectorV2", "MooncakePullConnector", "AscendStoreConnector", "PreemptOffloadConnector"],
+)
 @pytest.mark.parametrize("prefix_caching", [False, True])
 def test_configuration_validation_derives_recoverssm_before_worker_initialization(connector, prefix_caching):
     config = make_config()
@@ -68,9 +70,8 @@ def test_initialization_requires_speculative_decoding():
         ("cache_config", "mamba_cache_mode", "align", "Mamba cache mode none"),
         ("cache_config", "enable_prefix_caching", True, "Mamba cache mode align"),
         ("parallel_config", "pipeline_parallel_size", 2, "PP=1"),
-        ("parallel_config", "prefill_context_parallel_size", 2, "requires a Mooncake KV producer"),
+        ("parallel_config", "prefill_context_parallel_size", 2, "requires a KV producer"),
         ("parallel_config", "decode_context_parallel_size", 2, "DCP=1"),
-        (None, "kv_transfer_config", SimpleNamespace(kv_connector="AscendStoreConnector"), "requires Mooncake"),
     ],
 )
 def test_initialization_rejects_unsupported_execution(section, field, value, message):
@@ -103,9 +104,8 @@ def test_pcp_prefill_producer_and_dp_decode_consumer(connector, prefix_caching, 
     "section,field,value,message",
     [
         ("parallel_config", "tensor_parallel_size", 2, "PCP requires TP=1"),
-        ("kv_transfer_config", "kv_role", "kv_consumer", "PCP requires a Mooncake KV producer"),
-        ("kv_transfer_config", "kv_role", "kv_both", "PCP requires a Mooncake KV producer"),
-        ("kv_transfer_config", "kv_connector", "AscendStoreConnector", "requires Mooncake"),
+        ("kv_transfer_config", "kv_role", "kv_consumer", "PCP requires a KV producer"),
+        ("kv_transfer_config", "kv_role", "kv_both", "PCP requires a KV producer"),
     ],
 )
 def test_pcp_rejects_unsupported_execution(section, field, value, message):
@@ -135,3 +135,39 @@ def test_other_models_and_disabled_switch_keep_upstream_validation(monkeypatch):
     config.cache_config.use_replayssm = False
     assert patch_replayssm_config.validate_mamba_cached_kernel(config) is config
     assert called == [config, config]
+
+
+@pytest.mark.parametrize("connector", ["MooncakeConnectorV2", "MooncakePullConnector"])
+def test_recoverssm_consumer_multi_and_revalidated_children(connector):
+    config = make_config()
+    children = [
+        dict(kv_connector=connector, kv_role="kv_consumer"),
+        dict(kv_connector="PreemptOffloadConnector", kv_role="kv_consumer"),
+    ]
+    config.kv_transfer_config = SimpleNamespace(
+        kv_connector="MultiConnector", kv_role="kv_consumer", kv_connector_extra_config={"connectors": children}
+    )
+    validate_glm_recoverssm(config)
+    for child in children:
+        config.kv_transfer_config = SimpleNamespace(**child)
+        validate_glm_recoverssm(config)
+
+
+@pytest.mark.parametrize(
+    "names,role",
+    [
+        (["MooncakeConnectorV2"], "kv_consumer"),
+        (["PreemptOffloadConnector"], "kv_consumer"),
+        (["MooncakeConnectorV2", "AscendStoreConnector"], "kv_consumer"),
+        (["MooncakeConnectorV2", "PreemptOffloadConnector"], "kv_producer"),
+        (["MooncakeConnectorV2", "PreemptOffloadConnector", "AscendStoreConnector"], "kv_consumer"),
+    ],
+)
+def test_recoverssm_leaves_multi_composition_validation_to_connector(names, role):
+    config = make_config()
+    config.kv_transfer_config = SimpleNamespace(
+        kv_connector="MultiConnector",
+        kv_role=role,
+        kv_connector_extra_config={"connectors": [dict(kv_connector=n, kv_role=role) for n in names]},
+    )
+    validate_glm_recoverssm(config)

@@ -1347,6 +1347,12 @@ def should_skip_allreduce_across_dp_group(vllm_config: VllmConfig, is_draft_mode
     computed once in init, and select_moe_comm_method is just config lookups, so
     this is cheap and avoids id-reuse / stale-cache / init-ordering hazards.
     """
+    # Cross-DP dense projections require matching token rows and graph padding.
+    # Native fine-grained flags also shard draft projections; align both scopes.
+    finegrained = get_ascend_config().finegrained_tp_config
+    if finegrained.oproj_tensor_parallel_size > 1 or finegrained.mlp_tensor_parallel_size > 1:
+        return False
+
     ascend_config = get_ascend_config()
     # 1. When mc2_comm_alg == "hierarchy", dispatch/combine op don't support dynamic bs;
     # 2. When use mega_moe, op don't support dynamic global_bs;
