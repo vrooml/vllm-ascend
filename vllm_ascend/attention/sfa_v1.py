@@ -31,6 +31,7 @@ from vllm_ascend.attention.context_parallel.common_cp import (
     get_pcp_num_replicated_tokens,
 )
 from vllm_ascend.attention.dsa_attn_kv_plan import write_dsa_cache
+from vllm_ascend.attention.glm53_loop import LoopPass, get_loop_pass, joint_attention
 from vllm_ascend.attention.indexer import AscendSFAIndexerCache
 from vllm_ascend.attention.sparse_flash_mla import (
     HIF8_QUANT_MODE,
@@ -50,6 +51,7 @@ from vllm_ascend.attention.utils import (
     get_tq_fused_slot_bytes,
     get_tq_packed_bytes,
     has_requests_to_run_as_prefill,
+    mark_fused_preprocess_weights,
     maybe_save_kv_layer_to_connector,
     notify_kv_cache_written,
     split_decodes_and_prefills,
@@ -834,6 +836,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
 
 
 class AscendSFAImpl(MLAAttentionImpl):
+    _glm53_loop_enabled = False
+
     """
     NOTE: Please read the comment at the top of the file before trying to
     understand this class
@@ -1167,6 +1171,10 @@ class AscendSFAImpl(MLAAttentionImpl):
 
     def _fused_preprocess_type(self) -> PreprocessType | None:
         """Return the enabled fused preprocess type, or None if it cannot run."""
+        # Both passes call the same native Q/KV projections with different
+        # destinations. Keep those weights in their native layout.
+        if self._glm53_loop_enabled:
+            return None
         quant_method = self._get_layer_quant_method(self.fused_qkv_a_proj)
         qt = type(quant_method) if quant_method is not None else None
 
@@ -2245,6 +2253,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         project_gate = begin_gate(hidden_states) if begin_gate is not None else None
         if attn_metadata is None:
             return self._forward_dummy(hidden_states, output, project_gate, o_capacity)
+        if self._glm53_loop_enabled and (loop_pass := get_loop_pass()) is not None:
+            return self._forward_glm53_loop(hidden_states, kv_cache, attn_metadata, output, loop_pass)
 
         if self.qk_rope_head_dim == 0:
             num_tokens = min(hidden_states.shape[0], attn_metadata.slot_mapping.shape[0])
@@ -2470,6 +2480,105 @@ class AscendSFAImpl(MLAAttentionImpl):
         maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
 
         return output
+
+    def _forward_glm53_loop(
+        self,
+        hidden_states: torch.Tensor,
+        global_cache: tuple[torch.Tensor, ...],
+        global_metadata: M,
+        output: torch.Tensor,
+        loop_pass: LoopPass,
+    ) -> torch.Tensor:
+        num_tokens = global_metadata.num_actual_tokens
+        if num_tokens == 0:
+            return output.zero_()
+        local_cache = loop_pass.local_cache.kv_cache
+        metadata = get_forward_context().attn_metadata
+        assert isinstance(metadata, dict)
+        local_metadata = metadata[loop_pass.local_cache.layer_name]
+        assert isinstance(local_metadata, AscendSFAMetadata)
+        assert len(global_cache) == len(local_cache) == 2, "Loop attention requires split MLA KV caches."
+        assert self.fused_qkv_a_proj is not None and self.q_a_layernorm is not None
+        assert global_metadata.positions is not None
+        assert global_metadata.cos is not None and global_metadata.sin is not None
+
+        hidden_states = hidden_states[:num_tokens]
+        q_c, kv = self.fused_qkv_a_proj(hidden_states)[0].split(
+            (self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim), dim=-1
+        )
+        query_latent, query_rope = self._q_proj_and_k_up_proj(self.q_a_layernorm(q_c))
+        cos = global_metadata.cos[:num_tokens]
+        sin = global_metadata.sin[:num_tokens]
+        query_rope = self.rope_single(query_rope, cos, sin)
+        self.exec_kv(kv, cos, sin, local_cache, local_metadata.slot_mapping[:num_tokens], local_metadata)
+
+        # The scheduler supplies flattened queries in request order, with
+        # both block tables indexed in that same order.
+        cumulative = global_metadata.cum_query_lens.contiguous()
+        token_indices = torch.arange(num_tokens, device=hidden_states.device, dtype=cumulative.dtype)
+        token_requests = torch.searchsorted(cumulative, token_indices, right=True)
+        indices = loop_pass.topk_indices[:num_tokens]
+        if indices.ndim == 3:
+            indices = indices.squeeze(1)
+        attn_output = joint_attention(
+            query_latent,
+            query_rope,
+            (global_cache[0], global_cache[1]),
+            local_cache,
+            global_metadata.block_table,
+            local_metadata.block_table,
+            token_requests,
+            global_metadata.positions[:num_tokens],
+            indices,
+            self.scale,
+        )
+        attn_output = self._v_up_proj(attn_output)
+        if self.g_proj is not None:
+            flash_attention_gate(attn_output, self.g_proj(hidden_states.contiguous())[0])
+        self._finalize_o_proj(attn_output, output[:num_tokens])
+        output[num_tokens:].zero_()
+        return output
+
+
+class Glm53LoopCache(MLAAttention):
+    """Parameterless MLA owner for the independently bound second-pass pages."""
+
+    def __init__(self, source: MLAAttention, vllm_config: VllmConfig) -> None:
+        # The allocator uses the MLA layer type and these dimensions to
+        # construct the native latent/RoPE views. Attention runs on source.
+        nn.Module.__init__(self)
+        impl = source.impl
+        if (
+            type(impl) is not AscendSFAImpl
+            or impl.uses_packed_sfa_main_cache
+            or not impl.qk_rope_head_dim
+            or not impl.q_lora_rank
+            or impl.enable_sp
+            or impl._parallel_o_proj is not None
+        ):
+            raise ValueError("GLM-5.3 loop simulation requires native SFA, split MLA KV and unsharded token rows.")
+        self.layer_name = f"{source.layer_name}.loop_local"
+        self.num_heads = source.num_heads
+        self.kv_lora_rank = source.kv_lora_rank
+        self.qk_rope_head_dim = source.qk_rope_head_dim
+        self.kv_cache = ()
+        # A plain reference avoids registering the source's weights again.
+        object.__setattr__(self, "_source", source)
+        context = vllm_config.compilation_config.static_forward_context
+        if self.layer_name in context:
+            raise ValueError(f"Duplicate layer name: {self.layer_name}")
+        context[self.layer_name] = self
+        impl._glm53_loop_enabled = True
+        mark_fused_preprocess_weights(impl)
+
+    def get_attn_backend(self) -> type[AttentionBackend]:
+        return self._source.get_attn_backend()
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        spec = self._source.get_kv_cache_spec(vllm_config)
+        if spec.dtype not in (torch.bfloat16, torch.float16):
+            raise ValueError("GLM-5.3 loop simulation requires BF16 or FP16 MLA KV cache pages.")
+        return spec
 
 
 def turboquant_kv_rmsnorm_rope(
