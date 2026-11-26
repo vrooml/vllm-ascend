@@ -31,7 +31,7 @@ from vllm_ascend.attention.context_parallel.common_cp import (
     get_pcp_num_replicated_tokens,
 )
 from vllm_ascend.attention.dsa_attn_kv_plan import write_dsa_cache
-from vllm_ascend.attention.glm53_loop import LoopPass, get_loop_pass, joint_attention
+from vllm_ascend.attention.glm53_loop import LoopPass, get_loop_pass, pack_loop_attention_partial
 from vllm_ascend.attention.indexer import AscendSFAIndexerCache
 from vllm_ascend.attention.sparse_flash_mla import (
     HIF8_QUANT_MODE,
@@ -53,6 +53,7 @@ from vllm_ascend.attention.utils import (
     has_requests_to_run_as_prefill,
     mark_fused_preprocess_weights,
     maybe_save_kv_layer_to_connector,
+    merge_prefill_chunks,
     notify_kv_cache_written,
     split_decodes_and_prefills,
     trans_rope_weight,
@@ -2499,7 +2500,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         assert isinstance(local_metadata, AscendSFAMetadata)
         assert len(global_cache) == len(local_cache) == 2, "Loop attention requires split MLA KV caches."
         assert self.fused_qkv_a_proj is not None and self.q_a_layernorm is not None
-        assert global_metadata.positions is not None
         assert global_metadata.cos is not None and global_metadata.sin is not None
 
         hidden_states = hidden_states[:num_tokens]
@@ -2512,32 +2512,58 @@ class AscendSFAImpl(MLAAttentionImpl):
         query_rope = self.rope_single(query_rope, cos, sin)
         self.exec_kv(kv, cos, sin, local_cache, local_metadata.slot_mapping[:num_tokens], local_metadata)
 
-        # The scheduler supplies flattened queries in request order, with
-        # both block tables indexed in that same order.
-        cumulative = global_metadata.cum_query_lens.contiguous()
-        token_indices = torch.arange(num_tokens, device=hidden_states.device, dtype=cumulative.dtype)
-        token_requests = torch.searchsorted(cumulative, token_indices, right=True)
         indices = loop_pass.topk_indices[:num_tokens]
-        if indices.ndim == 3:
-            indices = indices.squeeze(1)
-        attn_output = joint_attention(
+        if indices.ndim == 2:
+            indices = indices.unsqueeze(1)
+
+        local_output, local_lse = self._glm53_loop_sfa_partial(
             query_latent,
             query_rope,
-            (global_cache[0], global_cache[1]),
             local_cache,
-            global_metadata.block_table,
-            local_metadata.block_table,
-            token_requests,
-            global_metadata.positions[:num_tokens],
-            indices,
-            self.scale,
+            loop_pass.swa_indices[:num_tokens],
+            local_metadata,
         )
-        attn_output = self._v_up_proj(attn_output)
+        global_output, global_lse = self._glm53_loop_sfa_partial(
+            query_latent,
+            query_rope,
+            global_cache,
+            indices,
+            global_metadata,
+        )
+        # SWA includes the current token, so put its finite LSE first.
+        merged, _, _ = merge_prefill_chunks(
+            [local_output, global_output], [local_lse, global_lse], None, return_lse=False
+        )
+        attn_output = self._v_up_proj(merged.reshape_as(query_latent).to(query_latent.dtype))
         if self.g_proj is not None:
             flash_attention_gate(attn_output, self.g_proj(hidden_states.contiguous())[0])
         self._finalize_o_proj(attn_output, output[:num_tokens])
         output[num_tokens:].zero_()
         return output
+
+    def _glm53_loop_sfa_partial(
+        self,
+        query_latent: torch.Tensor,
+        query_rope: torch.Tensor,
+        cache: tuple[torch.Tensor, ...],
+        indices: torch.Tensor,
+        metadata: AscendSFAMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Both index sets already encode visibility. The two calls keep their
+        # own block tables and each returns its max/sum in the same Q space.
+        partial_output, softmax_max, softmax_sum = DeviceOperator.execute_sparse_flash_attention_process(
+            self,
+            query_latent,
+            query_rope,
+            cache,
+            indices,
+            metadata,
+            metadata.cum_query_lens,
+            metadata.seq_lens,
+            sparse_mode=0,
+            return_lse=True,
+        )
+        return pack_loop_attention_partial(partial_output, softmax_max, softmax_sum)
 
 
 class Glm53LoopCache(MLAAttention):

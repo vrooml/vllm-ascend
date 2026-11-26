@@ -14,6 +14,7 @@ def test_forward_reuses_layers_and_keeps_each_first_pass_topk_group():
     loop_caches = tuple(SimpleNamespace(layer_name=f"local.{index}") for index in range(26, 54))
     calls = []
     segment_inputs = []
+    swa_indices = []
 
     class Layer:
         def __init__(self, index):
@@ -26,6 +27,7 @@ def test_forward_reuses_layers_and_keeps_each_first_pass_topk_group():
             if active_pass is not None:
                 local_index = self.index - 26
                 assert active_pass.local_cache is loop_caches[local_index]
+                swa_indices.append(active_pass.swa_indices)
                 expected_topk = torch.full_like(scratch, 26 + 4 * (local_index // 4))
                 torch.testing.assert_close(active_pass.topk_indices, expected_topk)
             elif 26 <= self.index < 54 and (self.index - 26) % 4 == 0:
@@ -52,5 +54,6 @@ def test_forward_reuses_layers_and_keeps_each_first_pass_topk_group():
         *((index, False) for index in range(54, 78)),
     ]
     assert segment_inputs == [(0, 3), (26, 55), (26, 69), (54, 97)]
+    assert all(indices is swa_indices[0] for indices in swa_indices)
     assert get_loop_pass() is None
     torch.testing.assert_close(output, torch.full((2,), 145.0))

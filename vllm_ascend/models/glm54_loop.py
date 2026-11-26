@@ -6,7 +6,7 @@ from vllm.config import VllmConfig
 from vllm.model_executor.models.deepseek_v2 import DeepseekV2Model, _get_llama_4_scaling
 from vllm.sequence import IntermediateTensors
 
-from vllm_ascend.attention.glm53_loop import loop_attention_pass, register_loop_cache
+from vllm_ascend.attention.glm53_loop import build_loop_swa_indices, loop_attention_pass, register_loop_cache
 from vllm_ascend.models.deepseek_mtp import AscendGlmMoeDsaForCausalLM
 from vllm_ascend.utils import should_reuse_topk
 
@@ -144,9 +144,10 @@ class Glm53LoopModel(DeepseekV2Model):
 
         loop_input = _apply_pass_gate(loop_input, hidden_states, residual, self.loop_gates[0])
         hidden_states, residual = loop_input, None
+        swa_indices = build_loop_swa_indices(positions)
         for local_idx, local_cache in enumerate(self.loop_local_caches):
             layer = self.layers[LOOP_START + local_idx]
-            with loop_attention_pass(local_cache, group_topk[local_idx // INDEX_GROUP_SIZE]):
+            with loop_attention_pass(local_cache, group_topk[local_idx // INDEX_GROUP_SIZE], swa_indices):
                 hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
 
         hidden_states = _apply_pass_gate(loop_input, hidden_states, residual, self.loop_gates[1])

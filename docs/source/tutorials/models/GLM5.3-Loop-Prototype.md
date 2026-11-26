@@ -2,7 +2,7 @@
 
 用完整版 GLM-5.3 的 `GlmMoeDsaForCausalLM` checkpoint 运行 GLM-5.4 的文本 Loop 拓扑。`Glm53LoopForCausalLM` 复用 78 层的权重和现有 Ascend loader。L1–26 执行一遍，L27–54 共用权重执行两遍，L55–78 执行一遍。
 
-第二轮按 query 复用第一轮的七组 top-k，读取同一物理层的第一轮全局 MLA KV，再加入独立缓存中最近 128 个位置的本轮 KV。两路一起计算 softmax，位置相同的两轮 KV 各占一个条目。当前实现为两轮分配独立的分页缓存。第二轮读取受滑窗限制，缓存仍按完整序列分配。
+第二轮使用同一份 query，分别对第一轮全局 MLA KV 的 top-k 和本轮 128-token 滑窗 KV 执行分页 SFA。两路各返回注意力输出和 `softmax_max`、`softmax_sum`。以 `max + log(sum)` 得到两路 LSE，并通过 `torch_npu.npu_attention_update` 合并输出。该权重等价于对两路拼接后的分数做一次 softmax。位置相同的两轮 KV 各占一个条目。每路有独立的分页缓存，第二轮缓存仍按完整序列分配。
 
 模型接受 `glm53_loop_gates` 两个标量，分别应用于两轮的写回 `x + gate * (h - x)`，默认 `[1.0, 1.0]`。这两个值模拟数据流。GLM-5.3 checkpoint 没有 GLM-5.4 训练得到的逐 token 门控参数。
 
@@ -10,7 +10,7 @@
 
 使用本分支和 `.github/vllm-main-verified.commit` 指定的 vLLM 版本。以下为单机 Atlas A3、16 个逻辑设备的参考命令。`MODEL_PATH` 指向 [GLM-5.3 W8A8C8 checkpoint](https://www.modelscope.cn/models/Eco-Tech/GLM-5.3-w8a8c8)，模型权重使用 Ascend 量化加载，注意力 KV 用 BF16。
 
-原型要求 eager、单实例 target 推理、PP/DP/PCP/DCP 均为 1，上下文最多 4096 token。启动时关闭 prefix caching。以下命令保留 TP16 和 EP，单请求先验证 1024 token 内的 prefill 和 decode。
+原型要求 `--enforce-eager`、单实例 target 推理、PP/DP/PCP/DCP 均为 1，上下文最多 4096 token。SFA 和 UpdateLSE 在 NPU 上运行，启动配置关闭 ACLGraph 和 prefix caching。以下命令保留 TP16 和 EP，单请求先验证 1024 token 内的 prefill 和 decode。
 
 ```bash
 cd /workspace
@@ -31,6 +31,14 @@ vllm serve "$MODEL_PATH" \
 ```
 
 ## 验证
+
+在 Atlas A3 上可先运行单卡算子测试，检查两路分页 SFA 的统计量和 UpdateLSE 输出。此测试使用随机张量。
+
+```bash
+python -m pytest -q tests/e2e/nightly/single_node/ops/singlecard_ops/test_glm53_loop_attention_update.py
+```
+
+服务启动后，检查权重加载和文本推理。
 
 ```bash
 curl -fsS http://127.0.0.1:8000/v1/models

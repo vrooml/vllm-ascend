@@ -10,9 +10,6 @@ from typing import Protocol
 import torch
 
 LOOP_WINDOW_SIZE = 128
-# Bound the gathered pages and fp32 attention workspace independently of
-# the number of tokens scheduled for a prefill step.
-_QUERY_TILE_SIZE = 16
 
 
 class LoopCache(Protocol):
@@ -24,6 +21,7 @@ class LoopCache(Protocol):
 class LoopPass:
     local_cache: LoopCache
     topk_indices: torch.Tensor
+    swa_indices: torch.Tensor
 
 
 _loop_pass: ContextVar[LoopPass | None] = ContextVar("glm53_loop_pass", default=None)
@@ -34,8 +32,10 @@ def get_loop_pass() -> LoopPass | None:
 
 
 @contextmanager
-def loop_attention_pass(local_cache: LoopCache, topk_indices: torch.Tensor) -> Iterator[None]:
-    token = _loop_pass.set(LoopPass(local_cache, topk_indices))
+def loop_attention_pass(
+    local_cache: LoopCache, topk_indices: torch.Tensor, swa_indices: torch.Tensor
+) -> Iterator[None]:
+    token = _loop_pass.set(LoopPass(local_cache, topk_indices, swa_indices))
     try:
         yield
     finally:
@@ -43,73 +43,27 @@ def loop_attention_pass(local_cache: LoopCache, topk_indices: torch.Tensor) -> I
 
 
 def register_loop_cache(attn_wrapper, vllm_config) -> LoopCache:
-    # Keep the tensor reference implementation importable without vLLM/NPU.
+    # Keep the tensor helpers importable without vLLM/NPU.
     from vllm_ascend.attention.sfa_v1 import Glm53LoopCache
 
     return Glm53LoopCache(attn_wrapper.mla_attn, vllm_config)
 
 
-def _gather_bank(
-    cache: tuple[torch.Tensor, torch.Tensor],
-    block_table: torch.Tensor,
-    requests: torch.Tensor,
-    key_positions: torch.Tensor,
-    query_positions: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    latent, rope = cache
-    block_size = latent.shape[1]
-    valid = (key_positions >= 0) & (key_positions <= query_positions[:, None])
-    logical_pages = key_positions.clamp_min(0) // block_size
-    valid &= logical_pages < block_table.shape[1]
-
-    pages = block_table[requests[:, None], logical_pages.clamp_max(block_table.shape[1] - 1)].long()
-    valid &= (pages >= 0) & (pages < latent.shape[0])
-    pages = torch.where(valid, pages, 0)
-    offsets = key_positions.remainder(block_size)
-    latent = latent[pages, offsets, 0].float().masked_fill(~valid[..., None], 0)
-    rope = rope[pages, offsets, 0].float().masked_fill(~valid[..., None], 0)
-    return latent, rope, valid
+def build_loop_swa_indices(positions: torch.Tensor) -> torch.Tensor:
+    """Build TND sparse indices with all valid slots before the -1 padding."""
+    positions = positions.to(torch.int32).unsqueeze(-1)
+    offsets = torch.arange(LOOP_WINDOW_SIZE, dtype=torch.int32, device=positions.device)
+    indices = (positions - (LOOP_WINDOW_SIZE - 1)).clamp_min(0) + offsets
+    return indices.masked_fill_(indices > positions, -1).unsqueeze(1)
 
 
-def joint_attention(
-    query_latent: torch.Tensor,
-    query_rope: torch.Tensor,
-    global_cache: tuple[torch.Tensor, torch.Tensor],
-    local_cache: tuple[torch.Tensor, torch.Tensor],
-    global_table: torch.Tensor,
-    local_table: torch.Tensor,
-    token_requests: torch.Tensor,
-    positions: torch.Tensor,
-    topk_indices: torch.Tensor,
-    scale: float,
-    window_size: int = LOOP_WINDOW_SIZE,
-) -> torch.Tensor:
-    """Attend to the sparse first pass and the sliding window of the second pass."""
-    if query_latent.shape[0] == 0:
-        return torch.empty_like(query_latent)
-
-    window_offsets = torch.arange(1 - window_size, 1, device=positions.device)
-    output = torch.empty_like(query_latent, memory_format=torch.contiguous_format)
-    for start in range(0, query_latent.shape[0], _QUERY_TILE_SIZE):
-        rows = slice(start, start + _QUERY_TILE_SIZE)
-        requests = token_requests[rows]
-        query_positions = positions[rows]
-        global_latent, global_rope, global_valid = _gather_bank(
-            global_cache, global_table, requests, topk_indices[rows].long(), query_positions
-        )
-        local_latent, local_rope, local_valid = _gather_bank(
-            local_cache, local_table, requests, query_positions[:, None] + window_offsets, query_positions
-        )
-
-        # Equal token positions in the two banks represent different hidden
-        # states and both participate in the same normalization.
-        latent = torch.cat((global_latent, local_latent), dim=1)
-        rope = torch.cat((global_rope, local_rope), dim=1)
-        valid = torch.cat((global_valid, local_valid), dim=1).unsqueeze(1)
-        scores = torch.bmm(query_latent[rows].float(), latent.transpose(1, 2))
-        scores += torch.bmm(query_rope[rows].float(), rope.transpose(1, 2))
-        scores *= scale
-        scores.masked_fill_(~valid, torch.finfo(scores.dtype).min)
-        probabilities = scores.softmax(dim=-1).masked_fill_(~valid, 0)
-        output[rows] = torch.bmm(probabilities, latent)
-    return output
+def pack_loop_attention_partial(
+    output: torch.Tensor, softmax_max: torch.Tensor, softmax_sum: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack SFA's [KV heads, tokens, groups] statistics in output row order."""
+    row_max = softmax_max.permute(1, 0, 2).reshape(-1).float()
+    row_sum = softmax_sum.permute(1, 0, 2).reshape(-1).float()
+    empty = row_sum == 0
+    lse = (row_max + row_sum.log()).masked_fill_(empty, -torch.inf)
+    rows = output.flatten(0, 1).float().masked_fill(empty[:, None], 0)
+    return rows, lse
